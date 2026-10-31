@@ -292,6 +292,8 @@ fn display(app: &mut App, ui: &mut Ui) {
         ui.checkbox(&mut prefs.show_scope, "Show the band scope on the Operate page (when an RTL-SDR dongle is found)");
         ui.checkbox(&mut prefs.scope_window, "Band scope in a window of its own (to make it big, or put it on another monitor)");
         ui.checkbox(&mut prefs.scope_band_plan, "Band scope: show the US band plan (CW/data and phone) and FT8/FT4 calling frequencies");
+        ui.checkbox(&mut prefs.scope_band_span, "Band scope: add a Band span that shows the whole band")
+            .on_hover_text("Fits the band the dial is in, whichever part you are tuned to. Outside the amateur bands, and on the other spans, the scope follows the dial as usual.");
         ui.label(
             RichText::new(
                 "The band scope and the audio waterfall fill the middle of the Operate page; drag the line between them to share it out. \

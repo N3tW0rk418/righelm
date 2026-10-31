@@ -88,6 +88,9 @@ pub struct UiPrefs {
     pub scope_height: u32,
     /// Show the US band plan (CW/data and phone segments) and FT8/FT4 spots.
     pub scope_band_plan: bool,
+    /// Offer the band scope's Band span, showing the whole band the dial is
+    /// in. The other spans follow the dial either way.
+    pub scope_band_span: bool,
     /// Widths of the Operate page's control columns (left and right of the
     /// scope), as last dragged.
     pub operate_left_w: u32,
@@ -123,6 +126,7 @@ impl Default for UiPrefs {
             scope_range_db: 50,
             scope_height: 220,
             scope_band_plan: true,
+            scope_band_span: false,
             operate_left_w: 290,
             operate_right_w: 300,
             scope_window: false,
