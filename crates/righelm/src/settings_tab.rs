@@ -15,6 +15,8 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         ui.add_space(12.0);
         scope_panel(app, ui);
         ui.add_space(12.0);
+        crate::logger_connect::settings_panel(app, ui);
+        ui.add_space(12.0);
         display(app, ui);
         ui.add_space(12.0);
         about(app, ui);

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::audio::AudioDevice;
 use crate::cw::{CwConfig, CwKeyer, KeyLine, LocalKeyLine, RemoteKeyLine};
 use crate::engine::{EngineConfig, Rig};
+use crate::logger::{LoggerConfig, LoggerConnect, SpotBook};
 use crate::remote::{AudioClient, Discovery, RemoteClientConfig, RemoteServer, RemoteServerConfig, RemoteTarget, ScopeClient};
 use crate::rigctld::{RigctldConfig, RigctldServer};
 use crate::scope::{CalibrationFix, Scope, ScopeConfig, ScopeStatus, ScopeTap};
@@ -38,6 +39,8 @@ pub struct Config {
     pub cw: CwConfig,
     /// Band scope from an RTL-SDR dongle on the radio's IF OUT or RX OUT.
     pub scope: ScopeConfig,
+    /// Logger Connect: DX spots from logging programs.
+    pub logger: LoggerConfig,
     /// Display preferences for the desktop app.
     pub ui: UiPrefs,
 }
@@ -169,6 +172,7 @@ impl Default for Config {
             tx_audio: TxAudioConfig::default(),
             cw: CwConfig::default(),
             scope: ScopeConfig::default(),
+            logger: LoggerConfig::default(),
             ui: UiPrefs::default(),
         }
     }
@@ -279,6 +283,9 @@ pub struct Services {
     scope_client: Option<(RemoteTarget, ScopeClient)>,
     /// What the last band scope calibration found.
     pub scope_calibration: Option<String>,
+    /// DX spots from logging programs.
+    pub spots: SpotBook,
+    logger: LoggerConnect,
 }
 
 /// The radio codec's capture and playback devices, if detected.
@@ -308,8 +315,11 @@ impl Services {
             scope: None,
             scope_client: None,
             scope_calibration: None,
+            spots: SpotBook::default(),
+            logger: LoggerConnect::default(),
         };
         s.apply_scope();
+        s.apply_logger();
         s.apply_local_rx();
         s.apply_tx_audio();
         s.discovery = Discovery::start().map_err(|e| log::warn!("LAN discovery unavailable: {e}")).ok();
@@ -422,6 +432,19 @@ impl Services {
                 }
             }
         }
+    }
+
+    /// Start, stop or restart the Logger Connect listener to match the config.
+    pub fn apply_logger(&mut self) {
+        let r = self.logger.apply(&self.spots, &self.config.logger);
+        if let Some(Err(e)) = r {
+            self.rig.note(format!("Logger Connect on port {} failed: {e}", self.config.logger.port));
+        }
+    }
+
+    /// Where Logger Connect listens, or why it can't; `None` when it's off.
+    pub fn logger_status(&self) -> Option<Result<String, String>> {
+        self.logger.status().map(|r| r.as_ref().map(|l| l.addr.to_string()).map_err(|e| e.clone()))
     }
 
     /// Keep the result of a band scope calibration (local dongle only).
@@ -683,6 +706,7 @@ impl Services {
         self.cw = None;
         self.scope = None;
         self.scope_client = None;
+        self.logger = LoggerConnect::default();
         self.rig.shutdown();
         // Give the engine a moment to un-key and send AI0.
         std::thread::sleep(std::time::Duration::from_millis(150));

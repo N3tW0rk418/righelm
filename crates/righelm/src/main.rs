@@ -6,6 +6,7 @@
 mod console;
 mod cw_key;
 mod demo;
+mod logger_connect;
 mod memories;
 mod menu_tab;
 mod operate;

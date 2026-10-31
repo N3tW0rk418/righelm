@@ -563,6 +563,8 @@ pub fn show(app: &mut crate::App, ui: &mut Ui, rig: &Rig, s: &RadioState) {
         feed_question(app, ui);
     }
     let tap = app.services.scope_tap.clone();
+    let logger = app.services.config.logger.clone();
+    let spot_book = app.services.spots.clone();
     let prefs = &mut app.services.config.ui;
     let bs = &mut app.scope;
     let vfo = s.rx_freq() as f64;
@@ -839,6 +841,10 @@ pub fn show(app: &mut crate::App, ui: &mut Ui, rig: &Rig, s: &RadioState) {
             pill(&p, at, if right { Align2::LEFT_TOP } else { Align2::RIGHT_TOP }, &freq_text(vfo), 12.0, AMBER);
         }
 
+        // DX spots from the logger.
+        let spots = if logger.enabled && logger.show_on_scope { spot_book.in_view(&logger, start, view_hi) } else { Vec::new() };
+        let markers = crate::logger_connect::draw(&p, spots, &logger, x_of, spec);
+
         if bs.transmitting || s.transmitting() {
             pill(&p, spec.center(), Align2::CENTER_CENTER, "TX — scope paused", 15.0, RED);
         } else if bs.history.is_empty() {
@@ -862,7 +868,10 @@ pub fn show(app: &mut crate::App, ui: &mut Ui, rig: &Rig, s: &RadioState) {
                 if let Some(snr) = bs.history.front().and_then(|r| level_at(r, rf)).zip(bs.noise).map(|(l, n)| l - n).filter(|v| *v > 3.0) {
                     text = format!("{text}  +{snr:.0} dB");
                 }
-                if shift {
+                if let Some(spot) = markers.at(pos) {
+                    bs.preview = None;
+                    text = crate::logger_connect::details(spot, &freq_text(spot.hz as f64), logger.send_call);
+                } else if shift {
                     bs.preview = None;
                     text = format!("{text}\nclick → exactly here");
                 } else {
@@ -914,7 +923,11 @@ pub fn show(app: &mut crate::App, ui: &mut Ui, rig: &Rig, s: &RadioState) {
         if resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let rf = hz_of(pos.x);
-                if shift {
+                if let Some(spot) = markers.at(pos) {
+                    crate::logger_connect::tune(rig, s, spot, &logger);
+                    spot_book.send_call(&logger, spot);
+                    bs.tuned = Some((format!("{} {}", spot.call, freq_text(spot.hz as f64)), Instant::now()));
+                } else if shift {
                     let hz = s.model.clamp_freq((rf / 10.0).round() as u64 * 10);
                     tune(bs, rig, s, &Target { dial: hz, signal: None, how: "" }, audio_lines);
                 } else if status.running {
