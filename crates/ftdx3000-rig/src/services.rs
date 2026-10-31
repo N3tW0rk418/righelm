@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::audio::AudioDevice;
 use crate::cw::{CwConfig, CwKeyer, KeyLine, LocalKeyLine, RemoteKeyLine};
 use crate::engine::{EngineConfig, Rig};
+use crate::ldg::{LdgConfig, LdgMemory, LdgTuner};
 use crate::remote::{AudioClient, Discovery, RemoteClientConfig, RemoteServer, RemoteServerConfig, RemoteTarget, ScopeClient};
 use crate::rigctld::{RigctldConfig, RigctldServer};
 use crate::scope::{CalibrationFix, Scope, ScopeConfig, ScopeStatus, ScopeTap};
@@ -38,6 +39,10 @@ pub struct Config {
     pub cw: CwConfig,
     /// Band scope from an RTL-SDR dongle on the radio's IF OUT or RX OUT.
     pub scope: ScopeConfig,
+    /// An LDG automatic tuner on its meter jack.
+    pub tuner: LdgConfig,
+    /// The tuner's antenna and mode as it last reported them.
+    pub tuner_last: LdgMemory,
     /// Display preferences for the desktop app.
     pub ui: UiPrefs,
 }
@@ -169,6 +174,8 @@ impl Default for Config {
             tx_audio: TxAudioConfig::default(),
             cw: CwConfig::default(),
             scope: ScopeConfig::default(),
+            tuner: LdgConfig::default(),
+            tuner_last: LdgMemory::default(),
             ui: UiPrefs::default(),
         }
     }
@@ -223,7 +230,10 @@ impl Config {
     /// the configured one no longer exists.
     pub fn autodetect_port(&mut self) -> Option<crate::detect::DetectedRadio> {
         let radios = crate::detect::detect_radios();
-        let first = radios.into_iter().next()?;
+        // Never the tuner's adapter: radio probes like `FA;` would reach it
+        // as commands (`A` toggles its antenna).
+        let tuner = (!self.tuner.port.is_empty()).then(|| std::fs::canonicalize(&self.tuner.port).ok()).flatten();
+        let first = radios.into_iter().find(|r| tuner.is_none() || std::fs::canonicalize(&r.cat.dev).ok() != tuner)?;
         let path = &self.engine.serial.path;
         if path.is_empty() || !std::path::Path::new(path).exists() {
             self.engine.serial.path = first.cat.stable_path().to_string();
@@ -279,6 +289,8 @@ pub struct Services {
     scope_client: Option<(RemoteTarget, ScopeClient)>,
     /// What the last band scope calibration found.
     pub scope_calibration: Option<String>,
+    /// The LDG tuner, when one is set up (on the radio's computer).
+    pub tuner: Option<LdgTuner>,
 }
 
 /// The radio codec's capture and playback devices, if detected.
@@ -308,8 +320,10 @@ impl Services {
             scope: None,
             scope_client: None,
             scope_calibration: None,
+            tuner: None,
         };
         s.apply_scope();
+        s.apply_tuner();
         s.apply_local_rx();
         s.apply_tx_audio();
         s.discovery = Discovery::start().map_err(|e| log::warn!("LAN discovery unavailable: {e}")).ok();
@@ -421,6 +435,18 @@ impl Services {
                     None => self.scope = Some(Scope::start(self.rig.clone(), self.scope_tap.clone(), self.config.scope.clone())),
                 }
             }
+        }
+    }
+
+    /// Run the LDG tuner's link to match the config. Call after changing
+    /// `config.tuner`. Not while controlling a remote radio: the tuner is
+    /// at the radio.
+    pub fn apply_tuner(&mut self) {
+        let want = self.config.tuner.enabled && self.config.engine.remote.is_none();
+        match (&self.tuner, want) {
+            (Some(t), true) => t.update(self.config.tuner.clone()),
+            (None, true) => self.tuner = Some(LdgTuner::start(self.rig.clone(), self.config.tuner.clone(), self.config.tuner_last.clone())),
+            (_, false) => self.tuner = None,
         }
     }
 
@@ -571,9 +597,14 @@ impl Services {
 
     /// Call regularly (every frame or so): after a (re)connect, set the
     /// radio's MIC SEL menus again if the computer mic is on; disarm the CW
-    /// key when it should no longer be live; keep a band scope calibration.
+    /// key when it should no longer be live; keep a band scope calibration
+    /// and the LDG tuner's last antenna and mode.
     pub fn tick(&mut self) {
         self.apply_calibration();
+        if let Some(m) = self.tuner.as_ref().map(LdgTuner::memory).filter(|m| *m != self.config.tuner_last) {
+            self.config.tuner_last = m;
+            let _ = self.config.save();
+        }
         if let Some(k) = &self.cw {
             let st = k.status();
             let settled = k.armed_at.elapsed() > std::time::Duration::from_secs(3);
