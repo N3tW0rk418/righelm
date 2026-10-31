@@ -318,7 +318,7 @@ radio**, set a password, and enable it. On any other computer, start the app and
 - **No stale commands.** Commands sent while the radio is disconnected are discarded, not
   replayed later.
 
-## Band scope (RTL-SDR dongle)
+## Band scope (RTL-SDR dongle or HackRF)
 
 The FTDX3000 doesn't send its own scope over CAT. An inexpensive RTL-SDR dongle on one of
 the radio's rear jacks gives RigHelm a wide band scope instead:
@@ -391,6 +391,10 @@ Dongles:
   ```
 
   then unplug and replug the dongle.
+- **HackRF One** works too, the same way (pick it in Settings if a dongle is also plugged
+  in). It has no gain control of its own: set its RF and baseband gain in *Settings → Band
+  scope*. RigHelm only ever receives with it and keeps its antenna power off. On Linux, the
+  `hackrf` package installs the udev rule it needs.
 
 **Remote:** a computer controlling the radio over the LAN shows the radio computer's band
 scope, with no dongle of its own. It asks for just the view it shows, so the stream is

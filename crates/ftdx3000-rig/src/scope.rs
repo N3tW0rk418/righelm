@@ -1,8 +1,9 @@
-//! Band scope: a wide spectrum of the band from an RTL-SDR dongle plugged
-//! into this computer and connected to the radio's IF OUT or RX OUT jack.
+//! Band scope: a wide spectrum of the band from an RTL-SDR dongle or a
+//! HackRF plugged into this computer and connected to the radio's IF OUT or
+//! RX OUT jack.
 //!
-//! * No other software: the dongle's USB driver is pure Rust
-//!   (`rtlsdr-nusb`), the same on Linux and macOS.
+//! * No other software: the USB drivers are pure Rust (`rtlsdr-nusb`, and
+//!   [`crate::hackrf`]), the same on Linux and macOS.
 //! * The dongle is found by itself, also when it's plugged in later, and is
 //!   only opened while somebody is watching.
 //! * IF OUT carries the radio's 9 MHz first IF, so the dongle stays put and
@@ -26,6 +27,7 @@ use rustfft::{Fft, FftPlanner};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::Rig;
+use crate::hackrf;
 
 /// Dongle sample rate: the highest that doesn't drop samples on most hosts.
 pub const SAMPLE_RATE: u32 = 2_048_000;
@@ -62,7 +64,7 @@ impl Feed {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ScopeConfig {
-    /// Use an RTL-SDR dongle when one is plugged in.
+    /// Use an RTL-SDR dongle or HackRF when one is plugged in.
     pub enabled: bool,
     pub feed: Feed,
     /// IF OUT: the IF frequency that corresponds to the receive dial.
@@ -71,16 +73,28 @@ pub struct ScopeConfig {
     pub if_inverted: bool,
     /// Correction for the dongle's crystal, in parts per million.
     pub ppm: i32,
-    /// Serial number of the dongle to use; empty = the first one found.
+    /// Serial number of the dongle to use (a HackRF's as `hackrf:<serial>`);
+    /// empty = the first one found.
     pub serial: String,
     /// RX OUT: the part of the crystal correction finer than whole ppm,
     /// applied in software (-0.5..0.5).
     pub ppm_fine: f64,
     /// The frequency has been calibrated against broadcast carriers.
     pub calibrated: bool,
+    /// HackRF: RF (0-40 dB, 8 dB steps) and baseband (0-62 dB, 2 dB steps)
+    /// gain, and its extra 14 dB front-end amplifier. It has no AGC.
+    pub hackrf_lna_db: u8,
+    pub hackrf_vga_db: u8,
+    pub hackrf_amp: bool,
     /// The user has said which jack the dongle is on (asked the first time
     /// one is plugged in: the picture is wrong if `feed` is).
     pub feed_confirmed: bool,
+}
+
+impl ScopeConfig {
+    fn hackrf_gains(&self) -> hackrf::Gains {
+        hackrf::Gains { lna_db: self.hackrf_lna_db, vga_db: self.hackrf_vga_db, amp: self.hackrf_amp }
+    }
 }
 
 impl Default for ScopeConfig {
@@ -96,6 +110,9 @@ impl Default for ScopeConfig {
             ppm_fine: 0.0,
             calibrated: false,
             feed_confirmed: false,
+            hackrf_lna_db: 16,
+            hackrf_vga_db: 20,
+            hackrf_amp: false,
         }
     }
 }
@@ -789,6 +806,9 @@ trait Source {
     /// Retune; queued samples from the old frequency are discarded.
     fn tune(&mut self, hz: u64) -> Result<(), String>;
     fn set_ppm(&mut self, ppm: i32) -> Result<(), String>;
+    fn set_hackrf_gains(&mut self, _gains: hackrf::Gains) -> Result<(), String> {
+        Ok(())
+    }
     /// The simulator places its signals with the scope's current mapping.
     fn set_mapping(&mut self, _map: Mapping) {}
 }
@@ -895,9 +915,196 @@ impl Drop for Dongle {
     }
 }
 
-/// Plugged-in dongles.
-fn list_dongles() -> Vec<rtlsdr_nusb::DeviceDescriptor> {
-    rtlsdr_nusb::Device::list().wait().unwrap_or_default()
+/// A HackRF. It samples 4 times faster than the scope needs, tuned
+/// [`HACKRF_OFFSET`] above where the scope looks, and the samples are moved
+/// back down and narrowed to [`SAMPLE_RATE`]: its strong spike at its own
+/// tuning (and the mirror images of signals around it) stay out of the
+/// picture. It has no crystal correction of its own: the tuning is
+/// corrected instead.
+struct HackRfSource {
+    device: hackrf::HackRf,
+    name: String,
+    center: u64,
+    ppm: i32,
+    down: Downconverter,
+    raw: Vec<Complex32>,
+    /// Converted samples not yet read.
+    ready: Vec<Complex32>,
+}
+
+const HACKRF_DECIMATION: usize = 4;
+const HACKRF_RATE: u32 = SAMPLE_RATE * HACKRF_DECIMATION as u32;
+/// An eighth of the HackRF's rate: past the edge of what the scope shows,
+/// and the frequency shift is then a cycle of 8 fixed steps.
+const HACKRF_OFFSET: u64 = HACKRF_RATE as u64 / 8;
+
+/// A half-band low-pass that halves the sample rate (Blackman-windowed
+/// sinc). Passes the middle 40 % of the output band, and keeps what would
+/// fold into it down by about 70 dB.
+struct HalfBand {
+    /// The taps that aren't zero (every other one in a half-band filter):
+    /// (position, value).
+    taps: Vec<(usize, f32)>,
+    len: usize,
+    history: Vec<Complex32>,
+}
+
+impl HalfBand {
+    fn new(len: usize) -> HalfBand {
+        debug_assert!(len % 4 == 3, "half-band length must be 4k+3");
+        let m = (len / 2) as f64;
+        let pi = std::f64::consts::PI;
+        let h: Vec<f64> = (0..len)
+            .map(|k| {
+                let x = k as f64 - m;
+                let sinc = if x == 0.0 { 1.0 } else { (pi * x / 2.0).sin() / (pi * x / 2.0) };
+                let w = 0.42 - 0.5 * (2.0 * pi * k as f64 / (len - 1) as f64).cos() + 0.08 * (4.0 * pi * k as f64 / (len - 1) as f64).cos();
+                sinc * w
+            })
+            .collect();
+        let sum: f64 = h.iter().sum();
+        let taps = h.iter().enumerate().filter(|(_, v)| v.abs() > 1e-12).map(|(k, v)| (k, (v / sum) as f32)).collect();
+        HalfBand { taps, len, history: Vec::new() }
+    }
+
+    fn process(&mut self, input: &[Complex32], out: &mut Vec<Complex32>) {
+        self.history.extend_from_slice(input);
+        let mut i = 0;
+        while i + self.len <= self.history.len() {
+            let w = &self.history[i..i + self.len];
+            out.push(self.taps.iter().fold(Complex32::default(), |a, &(k, t)| a + w[k] * t));
+            i += 2;
+        }
+        self.history.drain(..i);
+    }
+
+    fn reset(&mut self) {
+        self.history.clear();
+    }
+}
+
+/// From the HackRF's rate down to the scope's: shift up by [`HACKRF_OFFSET`]
+/// (to undo tuning that much higher), then halve the rate twice.
+struct Downconverter {
+    /// Where in the shift's cycle of 8 the next sample is.
+    step: usize,
+    first: HalfBand,
+    second: HalfBand,
+    mid: Vec<Complex32>,
+}
+
+impl Downconverter {
+    fn new() -> Downconverter {
+        // The second stage has the narrow transition (40 % → 60 % of its
+        // output band); the first only has to keep the far side away.
+        Downconverter { step: 0, first: HalfBand::new(23), second: HalfBand::new(59), mid: Vec::new() }
+    }
+
+    fn reset(&mut self) {
+        self.first.reset();
+        self.second.reset();
+    }
+
+    fn process(&mut self, input: &mut [Complex32], out: &mut Vec<Complex32>) {
+        let r = std::f32::consts::FRAC_1_SQRT_2;
+        let turn = [(1.0, 0.0), (r, r), (0.0, 1.0), (-r, r), (-1.0, 0.0), (-r, -r), (0.0, -1.0), (r, -r)];
+        for s in input.iter_mut() {
+            let (c, d) = turn[self.step];
+            *s *= Complex32::new(c, d);
+            self.step = (self.step + 1) % 8;
+        }
+        self.mid.clear();
+        self.first.process(input, &mut self.mid);
+        self.second.process(&self.mid, out);
+    }
+}
+
+/// What to ask a HackRF whose crystal is `ppm` fast for, to get `hz`.
+fn hackrf_tuning(hz: u64, ppm: i32) -> u64 {
+    (hz as f64 / (1.0 + ppm.clamp(-200, 200) as f64 * 1e-6)).round() as u64
+}
+
+impl HackRfSource {
+    fn open(info: &hackrf::Info, hz: u64, cfg: &ScopeConfig) -> Result<HackRfSource, String> {
+        let device = hackrf::HackRf::open(info, hackrf_tuning(hz + HACKRF_OFFSET, cfg.ppm), HACKRF_RATE, cfg.hackrf_gains())?;
+        Ok(HackRfSource { device, name: info.describe(), center: hz, ppm: cfg.ppm, down: Downconverter::new(), raw: Vec::new(), ready: Vec::new() })
+    }
+
+    fn retune(&mut self) -> Result<(), String> {
+        self.down.reset();
+        self.ready.clear();
+        self.device.set_frequency(hackrf_tuning(self.center + HACKRF_OFFSET, self.ppm))
+    }
+}
+
+impl Source for HackRfSource {
+    fn describe(&self) -> String {
+        self.name.clone()
+    }
+
+    fn read(&mut self, buf: &mut [Complex32]) -> Result<usize, String> {
+        while self.ready.len() < buf.len() {
+            self.raw.resize(buf.len() * HACKRF_DECIMATION, Complex32::default());
+            self.device.read(&mut self.raw)?;
+            self.down.process(&mut self.raw, &mut self.ready);
+        }
+        let n = buf.len();
+        buf.copy_from_slice(&self.ready[..n]);
+        self.ready.drain(..n);
+        Ok(n)
+    }
+
+    fn tune(&mut self, hz: u64) -> Result<(), String> {
+        self.center = hz;
+        self.retune()
+    }
+
+    fn set_ppm(&mut self, ppm: i32) -> Result<(), String> {
+        self.ppm = ppm;
+        self.retune()
+    }
+
+    fn set_hackrf_gains(&mut self, gains: hackrf::Gains) -> Result<(), String> {
+        self.device.set_gains(gains)
+    }
+}
+
+/// A receiver the scope can use.
+#[derive(Clone)]
+enum Found {
+    Rtl(rtlsdr_nusb::DeviceDescriptor),
+    HackRf(hackrf::Info),
+}
+
+impl Found {
+    /// What [`ScopeConfig::serial`] holds to pick this one. An RTL-SDR's is
+    /// its bare serial, as before HackRFs were supported.
+    fn key(&self) -> String {
+        match self {
+            Found::Rtl(d) => d.serial.clone().unwrap_or_default(),
+            Found::HackRf(h) => format!("hackrf:{}", h.serial),
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Found::Rtl(d) => describe_dongle(d),
+            Found::HackRf(h) => h.describe(),
+        }
+    }
+
+    fn open(&self, hz: u64, cfg: &ScopeConfig) -> Result<Box<dyn Source>, String> {
+        Ok(match self {
+            Found::Rtl(d) => Box::new(Dongle::open(d, hz, cfg.ppm)?),
+            Found::HackRf(h) => Box::new(HackRfSource::open(h, hz, cfg)?),
+        })
+    }
+}
+
+/// Plugged-in dongles and HackRFs.
+fn list_dongles() -> Vec<Found> {
+    let rtl = rtlsdr_nusb::Device::list().wait().unwrap_or_default().into_iter().map(Found::Rtl);
+    rtl.chain(hackrf::list().into_iter().map(Found::HackRf)).collect()
 }
 
 // --------------------------------------------------------------- the scope
@@ -953,16 +1160,16 @@ fn run(rig: &Rig, tap: &ScopeTap, config: &Mutex<ScopeConfig>, stop: &AtomicBool
         }
         let sim = simulated();
         let found = if sim { Vec::new() } else { list_dongles() };
-        let dongles: Vec<(String, String)> = found.iter().map(|d| (d.serial.clone().unwrap_or_default(), describe_dongle(d))).collect();
-        let pick = found.iter().find(|d| !cfg.serial.is_empty() && d.serial.as_deref() == Some(cfg.serial.as_str())).or(found.first()).cloned();
+        let dongles: Vec<(String, String)> = found.iter().map(|d| (d.key(), d.describe())).collect();
+        let pick = found.iter().find(|d| !cfg.serial.is_empty() && d.key() == cfg.serial).or(found.first()).cloned();
         if pick.is_none() && !sim {
-            tap.set_status(ScopeStatus { text: "no RTL-SDR dongle plugged in".into(), ..Default::default() });
+            tap.set_status(ScopeStatus { text: "no RTL-SDR dongle or HackRF plugged in".into(), ..Default::default() });
             sleep_unless(stop, Duration::from_secs(2));
             continue;
         }
         let present = ScopeStatus { present: true, feed: Some(cfg.feed), dongles: dongles.clone(), ..Default::default() };
         if !tap.has_watchers() && !tap.calibration_wanted() {
-            let name = pick.as_ref().map(describe_dongle).unwrap_or_else(|| "simulated dongle".into());
+            let name = pick.as_ref().map(Found::describe).unwrap_or_else(|| "simulated dongle".into());
             tap.set_status(ScopeStatus { text: format!("{name} — ready (opens while the band scope is on screen)"), ..present });
             sleep_unless(stop, Duration::from_millis(300));
             continue;
@@ -971,7 +1178,7 @@ fn run(rig: &Rig, tap: &ScopeTap, config: &Mutex<ScopeConfig>, stop: &AtomicBool
         let center = wanted_center(&cfg, vfo, None);
         let source: Result<Box<dyn Source>, String> = match &pick {
             None => Ok(Box::new(SimSource::new(center))),
-            Some(d) => Dongle::open(d, center, cfg.ppm).map(|d| Box::new(d) as Box<dyn Source>),
+            Some(d) => d.open(center, &cfg),
         };
         match source {
             Ok(source) => {
@@ -1021,6 +1228,7 @@ fn stream(
     let mut buf = vec![Complex32::default(); 32_768];
     let mut idle_since: Option<Instant> = None;
     let mut ppm = opened.ppm;
+    let mut gains = opened.hackrf_gains();
     let mut last_status = Instant::now() - Duration::from_secs(1);
     // Calibrate by itself once the picture has settled, until it works.
     let started = Instant::now();
@@ -1045,7 +1253,10 @@ fn stream(
             rows.reset();
             smooth.clear();
             steady.clear();
-            steady.clear();
+        }
+        if cfg.hackrf_gains() != gains {
+            gains = cfg.hackrf_gains();
+            source.set_hackrf_gains(gains)?;
         }
         let (vfo, transmitting) = {
             let s = rig.state();
@@ -1460,5 +1671,53 @@ mod tests {
         assert_eq!(level_db(encode_db(-73.5)), Some(-73.5));
         assert_eq!(encode_db(-500.0), 1);
         assert_eq!(level_db(0), None);
+    }
+
+    /// Level (dB) of a tone through the HackRF's downconverter, which moves
+    /// it up by the offset.
+    fn through_downconverter(hz: f64) -> f32 {
+        let rate = HACKRF_RATE as f64;
+        let mut input: Vec<Complex32> = (0..HACKRF_RATE as usize / 50)
+            .map(|i| {
+                let ph = 2.0 * std::f64::consts::PI * hz * i as f64 / rate;
+                Complex32::new(ph.cos() as f32, ph.sin() as f32)
+            })
+            .collect();
+        let mut out = Vec::new();
+        let mut d = Downconverter::new();
+        d.process(&mut input, &mut out);
+        let tail = &out[out.len() / 2..];
+        let p = tail.iter().map(|s| s.norm_sqr()).sum::<f32>() / tail.len() as f32;
+        10.0 * p.log10()
+    }
+
+    #[test]
+    fn hackrf_offset_keeps_the_view_and_drops_its_own_spike() {
+        let off = HACKRF_OFFSET as f64;
+        let half = SAMPLE_RATE as f64 * USABLE / 2.0;
+        // What the scope shows comes through whole.
+        for f in [-half, -half / 2.0, 0.0, half / 2.0, half] {
+            let db = through_downconverter(f - off);
+            assert!(db.abs() < 0.2, "{f} Hz: {db} dB");
+        }
+        // The HackRF's own spike (at its tuning, 0 Hz) lands past the edge.
+        assert!(off > half * 1.2);
+        // Anything that would fold into the view is gone.
+        for f in [0.5e6, 1.0e6, 1.5e6, 2.0e6, 3.0e6, -3.5e6] {
+            let db = through_downconverter(f);
+            let lands = f + off;
+            let folds = (lands / SAMPLE_RATE as f64).round() * SAMPLE_RATE as f64;
+            if (lands - folds).abs() < half {
+                assert!(db < -60.0, "{f} Hz lands in view: {db} dB");
+            }
+        }
+    }
+
+    #[test]
+    fn hackrf_tuning_corrects_the_crystal() {
+        assert_eq!(hackrf_tuning(9_000_000, 0), 9_000_000);
+        // A crystal 10 ppm fast is asked for 10 ppm less.
+        assert_eq!(hackrf_tuning(10_000_000, 10), 9_999_900);
+        assert_eq!(hackrf_tuning(10_000_000, -10), 10_000_100);
     }
 }

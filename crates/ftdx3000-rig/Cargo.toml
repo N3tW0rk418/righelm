@@ -13,6 +13,7 @@ gethostname = "1.1.0"
 hmac = "0.13.0"
 if-addrs = "0.15.0"
 log.workspace = true
+nusb = "0.2.8"
 parking_lot = "0.13.0"
 rtlsdr-nusb = "0.3.0"
 rustfft = "6.4.1"
