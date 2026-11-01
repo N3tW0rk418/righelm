@@ -337,6 +337,8 @@ On screen:
   thin strip under the spectrum shows the US band plan (blue CW/data, green phone) with
   the FT8/FT4 calling frequencies in purple (*Settings → Display* turns it off).
 - The bright line is the spectrum, the faint one above it the recent peaks.
+- *Settings → Display* can add a **Band** span, which shows the whole band whichever part
+  you are tuned to. The other spans follow the dial as usual.
 - **Click a signal to go straight to it.** Hover first and the scope marks the signal it
   found and shows where a click will tune. It looks at the signal at full resolution and
   tunes the way the mode needs:

@@ -22,6 +22,10 @@ use ftdx3000_rig::{Rig, UiPrefs};
 use crate::waterfall::{cw_upper, passband, pitch, rf_of_audio, rx_vfo};
 use crate::widgets::{self, AMBER, RED, ink};
 
+/// `scope_span` for the Band button (0 is Full, the rest are in Hz).
+const BAND_SPAN: u32 = 1;
+/// What the Band span shows away from any band.
+const BAND_SPAN_ELSEWHERE: f64 = 200_000.0;
 const COLS: usize = 1024;
 const ROWS: usize = 300;
 /// Where there's no data (outside what the dongle covers).
@@ -158,10 +162,26 @@ impl BandScope {
     }
 }
 
-/// The span to show, for the dongle's coverage.
-fn span_hz(prefs: &UiPrefs, covers: Option<(f64, f64)>) -> f64 {
+/// The amateur band the dial is in.
+fn band_at(s: &RadioState, hz: f64) -> Option<(f64, f64)> {
+    s.model.bands.iter().filter(|b| b.label != "GEN").map(|b| (b.lo as f64, b.hi as f64)).find(|(lo, hi)| (*lo..=*hi).contains(&hz))
+}
+
+/// The band to fit the view to: only with the Band span, the others follow
+/// the dial.
+fn view_band(prefs: &UiPrefs, s: &RadioState, vfo: f64) -> Option<(f64, f64)> {
+    if prefs.scope_band_span && prefs.scope_span == BAND_SPAN { band_at(s, vfo) } else { None }
+}
+
+/// The span to show, for the dongle's coverage and the band to fit, if any.
+fn span_hz(prefs: &UiPrefs, covers: Option<(f64, f64)>, band: Option<(f64, f64)>) -> f64 {
     let full = covers.map_or(1_600_000.0, |(lo, hi)| hi - lo);
-    if prefs.scope_span == 0 { full } else { (prefs.scope_span as f64).min(full) }
+    match prefs.scope_span {
+        0 => full,
+        // A little more than the band, so its edges show.
+        BAND_SPAN => band.map_or(BAND_SPAN_ELSEWHERE, |(lo, hi)| (hi - lo) * 1.1).min(full),
+        hz => (hz as f64).min(full),
+    }
 }
 
 /// Keep the VFO in view: show everything when the span covers the dongle's
@@ -180,6 +200,20 @@ fn follow(center: Option<f64>, vfo: f64, span: f64, covers: Option<(f64, f64)>) 
         // Don't show emptiness beside the dongle's range when there's data.
         Some((lo, hi)) if hi - lo > span => c.clamp(lo + span / 2.0, hi - span / 2.0),
         _ => c,
+    }
+}
+
+/// Fit a view to the band: centred on it, or inside its edges where the
+/// dongle can't show it all (10 m), and within what the dongle covers.
+fn in_band(center: f64, span: f64, band: Option<(f64, f64)>, covers: Option<(f64, f64)>) -> f64 {
+    let Some((lo, hi)) = band else { return center };
+    if covers.is_some_and(|(a, b)| span >= (b - a) * 0.999) {
+        return center;
+    }
+    let c = if span >= hi - lo { (lo + hi) / 2.0 } else { center.clamp(lo + span / 2.0, hi - span / 2.0) };
+    match covers {
+        Some((a, b)) => c.clamp(a + span / 2.0, b - span / 2.0),
+        None => c,
     }
 }
 
@@ -566,8 +600,9 @@ pub fn show(app: &mut crate::App, ui: &mut Ui, rig: &Rig, s: &RadioState) {
     let prefs = &mut app.services.config.ui;
     let bs = &mut app.scope;
     let vfo = s.rx_freq() as f64;
-    let span = span_hz(prefs, status.covers);
-    let center = follow(bs.center, vfo, span, status.covers);
+    let band = view_band(prefs, s, vfo);
+    let span = span_hz(prefs, status.covers, band);
+    let center = in_band(follow(bs.center, vfo, span, status.covers), span, band, status.covers);
     bs.center = Some(center);
     let col_hz = span / COLS as f64;
     let start = center - span / 2.0;
@@ -619,6 +654,9 @@ pub fn show(app: &mut crate::App, ui: &mut Ui, rig: &Rig, s: &RadioState) {
                 prefs.scope_window = !own_window;
             }
             ui.label("Span");
+            if prefs.scope_band_span && ui.selectable_label(prefs.scope_span == BAND_SPAN, "Band").on_hover_text("Show the whole band the dial is in").clicked() {
+                prefs.scope_span = BAND_SPAN;
+            }
             for (hz, label) in SPANS {
                 let r = ui.selectable_label(prefs.scope_span == hz, label);
                 crate::demo::mark(format!("span:{label}"), r.rect);
@@ -943,6 +981,65 @@ mod tests {
 
     fn sig(peak: f64, lo: f64, hi: f64) -> Option<Signal> {
         Some(Signal { peak_hz: peak, lo_hz: lo, hi_hz: hi, snr_db: 30.0 })
+    }
+
+    #[test]
+    fn only_the_band_span_is_fitted_to_the_band() {
+        let s = radio("2", 14_323_000);
+        let prefs = |scope_span, scope_band_span| UiPrefs { scope_span, scope_band_span, ..Default::default() };
+        assert!(view_band(&prefs(BAND_SPAN, true), &s, 14_323_000.0).is_some());
+        for span in SPANS.map(|(hz, _)| hz) {
+            assert_eq!(view_band(&prefs(span, true), &s, 14_323_000.0), None, "{span}");
+        }
+        // Turned off while on the Band span.
+        assert_eq!(view_band(&prefs(BAND_SPAN, false), &s, 14_323_000.0), None);
+        // Outside the amateur bands.
+        assert_eq!(view_band(&prefs(BAND_SPAN, true), &s, 15_000_000.0), None);
+    }
+
+    #[test]
+    fn fits_the_view_to_the_band() {
+        let band = Some((18_068_000.0, 18_168_000.0));
+        let covers = Some((17.0e6, 19.0e6));
+        // No band to fit: as it was.
+        assert_eq!(in_band(18_160_000.0, 50_000.0, None, covers), 18_160_000.0);
+        // Narrower than the band (10 m): it stops at the band's edges.
+        assert_eq!(in_band(18_160_000.0, 50_000.0, band, covers), 18_143_000.0);
+        assert_eq!(in_band(18_070_000.0, 50_000.0, band, covers), 18_093_000.0);
+        // In the middle it isn't moved.
+        assert_eq!(in_band(18_110_000.0, 50_000.0, band, covers), 18_110_000.0);
+        // A view wider than the band is centred on it, wherever the dial is.
+        assert_eq!(in_band(18_160_000.0, 110_000.0, band, covers), 18_118_000.0);
+        // Everything the dongle covers stays as it is.
+        assert_eq!(in_band(18_000_000.0, 2.0e6, band, covers), 18_000_000.0);
+        // Never beyond what the dongle covers.
+        assert_eq!(in_band(18_110_000.0, 110_000.0, band, Some((18_100_000.0, 19.0e6))), 18_155_000.0);
+    }
+
+    #[test]
+    fn band_span_fits_the_band() {
+        let prefs = UiPrefs { scope_span: BAND_SPAN, ..Default::default() };
+        let covers = Some((17.0e6, 19.0e6));
+        assert!((span_hz(&prefs, covers, Some((18_068_000.0, 18_168_000.0))) - 110_000.0).abs() < 1.0);
+        // Outside a band, or with the setting turned off afterwards.
+        assert_eq!(span_hz(&prefs, covers, None), BAND_SPAN_ELSEWHERE);
+        // Never wider than the dongle covers (10 m is 1.7 MHz).
+        assert_eq!(span_hz(&prefs, Some((27.0e6, 28.6e6)), Some((28.0e6, 29.7e6))), 1_600_000.0);
+        // The ordinary spans are as they were.
+        assert_eq!(span_hz(&UiPrefs { scope_span: 50_000, ..Default::default() }, covers, None), 50_000.0);
+        assert_eq!(span_hz(&UiPrefs { scope_span: 0, ..Default::default() }, covers, None), 2.0e6);
+    }
+
+    #[test]
+    fn the_band_comes_from_the_radio_model() {
+        let s = radio("3", 18_100_000);
+        assert_eq!(band_at(&s, 18_100_000.0).map(|(lo, hi)| lo < 18_100_000.0 && hi > 18_100_000.0), Some(true));
+        assert_eq!(band_at(&s, 15_000_000.0), None);
+    }
+
+    #[test]
+    fn the_band_span_is_off_by_default() {
+        assert!(!UiPrefs::default().scope_band_span);
     }
 
     #[test]
