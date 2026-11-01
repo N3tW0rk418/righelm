@@ -171,6 +171,10 @@ pub fn settings_panel(app: &mut App, ui: &mut Ui) {
         ui.set_width(ui.available_width());
         ui.label(RichText::new("Logger Connect").strong().size(16.0).color(ink(AMBER)));
         ui.label(RichText::new("Show DX spots from your logging program on the band scope. RigHelm only listens: spots never change anything by themselves.").color(DIM));
+        if app.services.spots.mirrored() {
+            ui.label(RichText::new(format!("Showing what the radio's computer shows · {} spots. Your logger and these settings are on that computer.", stats.held)).color(ink(GREEN)));
+            return;
+        }
         let cfg = &mut app.services.config.logger;
         ui.checkbox(&mut cfg.enabled, "Listen for spots from logging programs");
         if !cfg.enabled {

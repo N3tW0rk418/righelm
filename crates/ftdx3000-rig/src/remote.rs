@@ -34,6 +34,7 @@ use sha2::Sha256;
 
 use crate::audio::{self, AudioDevice, Capture, Playback};
 use crate::engine::{Rig, Source};
+use crate::logger::{SharedSpot, SpotBook, SpotShare};
 use crate::scope::{Detail, Feed, ScopeRow, ScopeStatus, ScopeSubscription, ScopeTap, ScopeView};
 use crate::transport::Link;
 use crate::vport::{self, SharedWriter, VirtualPortConfig};
@@ -346,8 +347,9 @@ pub struct RemoteServer {
 }
 
 impl RemoteServer {
-    /// `scope` is this computer's band scope, shared with clients that ask.
-    pub fn start(rig: Rig, cfg: RemoteServerConfig, scope: ScopeTap) -> io::Result<RemoteServer> {
+    /// `scope` is this computer's band scope, and `spots` its logger's DX
+    /// spots, shared with clients that ask.
+    pub fn start(rig: Rig, cfg: RemoteServerConfig, scope: ScopeTap, spots: SpotBook) -> io::Result<RemoteServer> {
         let listener = TcpListener::bind(&cfg.bind)?;
         listener.set_nonblocking(true)?;
         let addr = listener.local_addr()?;
@@ -398,17 +400,17 @@ impl RemoteServer {
             let gate = Arc::new(Gate::default());
             let (rig, cfg, stop, status, sessions) = (rig.clone(), cfg.clone(), stop.clone(), status.clone(), sessions.clone());
             let alive_guard = alive.clone();
-            let scope = scope.clone();
+            let (scope, spots) = (scope.clone(), spots.clone());
             thread::Builder::new().name("remote-accept".into()).spawn(move || {
                 let _alive_guard = alive_guard;
                 while !stop.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((stream, peer)) => {
                             let _ = stream.set_nonblocking(false);
-                            let (rig, cfg, stop, status, sessions, gate, scope) =
-                                (rig.clone(), cfg.clone(), stop.clone(), status.clone(), sessions.clone(), gate.clone(), scope.clone());
+                            let (rig, cfg, stop, status, sessions, gate, scope, spots) =
+                                (rig.clone(), cfg.clone(), stop.clone(), status.clone(), sessions.clone(), gate.clone(), scope.clone(), spots.clone());
                             let _ = thread::Builder::new().name(format!("remote-{peer}")).spawn(move || {
-                                if let Err(e) = serve_session(&rig, &cfg, stream, peer, &stop, &status, &sessions, &gate, &scope) {
+                                if let Err(e) = serve_session(&rig, &cfg, stream, peer, &stop, &status, &sessions, &gate, &scope, &spots) {
                                     log::debug!("remote session {peer}: {e}");
                                 }
                             });
@@ -600,6 +602,7 @@ fn serve_session(
     sessions: &Arc<Mutex<HashMap<u64, AudioSession>>>,
     gate: &Arc<Gate>,
     scope: &ScopeTap,
+    spots: &SpotBook,
 ) -> io::Result<()> {
     stream.set_nodelay(true)?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -693,7 +696,7 @@ fn serve_session(
         }
         "SCOPE" => {
             rig.note(format!("remote band scope session from {peer}"));
-            let r = serve_scope(scope, stream, reader, stop);
+            let r = serve_scope(scope, spots, stream, reader, stop);
             rig.note(format!("remote band scope session from {peer} ended"));
             r
         }
@@ -1088,17 +1091,23 @@ fn audio_session(
 /// * `S` status: flags u8 (1 = present, 2 = running), feed u8 (0 none,
 ///   1 IF OUT, 2 RX OUT), covers lo f64, hi f64 (0 = unknown), text.
 /// * `D` detail: id u32, start_hz f64, bin_hz f64, levels f32 (dB).
+/// * `L` logger spots: flags u8 (1 = first part, 2 = last part, 4 = clicking
+///   sets the mode, 8 = clicking fills in the logger), then a JSON array of
+///   spots. The parts between a first and a last are the whole list.
 ///
 /// Client to server, text lines: `VIEW <centre Hz> <span Hz> <cols> <fps>`
 /// starts rows for that view, `IDLE` stops them, `DETAIL <id> <lo> <hi>`
-/// asks for a full-resolution look at `lo..hi`; a bare newline is a
-/// heartbeat. The server sends nothing until the client's first line.
+/// asks for a full-resolution look at `lo..hi`, `SPOTS` asks for the logger's
+/// spots from now on, `SPOTCALL <Hz> <call>` fills in the logger on the
+/// server's computer with a spot it sent; a bare newline is a heartbeat. The
+/// server sends nothing until the client's first line.
 pub mod scope_msg {
     use super::*;
 
     pub const ROW: u8 = b'R';
     pub const STATUS: u8 = b'S';
     pub const DETAIL: u8 = b'D';
+    pub const SPOTS: u8 = b'L';
     /// Largest payload a client accepts.
     pub const MAX_LEN: usize = 16_384;
 
@@ -1181,6 +1190,55 @@ pub mod scope_msg {
         Some((id, Detail { start_hz, bin_hz, db }))
     }
 
+    /// The spots in messages small enough for any client's `MAX_LEN`. There
+    /// is always one, so that an empty list gets through too.
+    pub fn spots(share: &SpotShare) -> Vec<Vec<u8>> {
+        let mut parts: Vec<String> = vec![String::new()];
+        for s in &share.spots {
+            let Ok(text) = serde_json::to_string(s) else { continue };
+            // A flags byte, two brackets, a comma.
+            if text.len() + 4 > MAX_LEN {
+                continue;
+            }
+            if parts.last().is_some_and(|p| p.len() + text.len() + 4 > MAX_LEN) {
+                parts.push(String::new());
+            }
+            let p = parts.last_mut().expect("never empty");
+            if !p.is_empty() {
+                p.push(',');
+            }
+            p.push_str(&text);
+        }
+        let last = parts.len() - 1;
+        let settings = (share.click_sets_mode as u8) << 2 | (share.send_call as u8) << 3;
+        let framed = parts.iter().enumerate().map(|(i, part)| {
+            let mut p = vec![(i == 0) as u8 | ((i == last) as u8) << 1 | settings, b'['];
+            p.extend_from_slice(part.as_bytes());
+            p.push(b']');
+            frame(SPOTS, p)
+        });
+        framed.collect()
+    }
+
+    /// One part: is it the first, is it the last, and what it says.
+    pub fn parse_spots(p: &[u8]) -> Option<(bool, bool, SpotShare)> {
+        let flags = *p.first()?;
+        let spots: Vec<SharedSpot> = serde_json::from_slice(p.get(1..)?).ok()?;
+        Some((flags & 1 != 0, flags & 2 != 0, SpotShare { click_sets_mode: flags & 4 != 0, send_call: flags & 8 != 0, spots }))
+    }
+
+    pub fn call_line(hz: u64, call: &str) -> String {
+        format!("SPOTCALL {hz} {call}\n")
+    }
+
+    pub fn parse_call_line(line: &str) -> Option<(u64, &str)> {
+        let mut it = line.split_whitespace();
+        if it.next()? != "SPOTCALL" {
+            return None;
+        }
+        Some((it.next()?.parse().ok()?, it.next()?))
+    }
+
     pub fn detail_line(id: u32, lo: f64, hi: f64) -> String {
         format!("DETAIL {id} {lo:.0} {hi:.0}\n")
     }
@@ -1209,16 +1267,18 @@ pub mod scope_msg {
 }
 
 /// Serve this computer's band scope to a remote client: rows for the view it
-/// asks for, and the scope's status, until it goes away.
-fn serve_scope(scope: &ScopeTap, stream: TcpStream, mut reader: BufReader<TcpStream>, stop: &Arc<AtomicBool>) -> io::Result<()> {
+/// asks for, the scope's status, and the logger's spots if it wants them,
+/// until it goes away.
+fn serve_scope(scope: &ScopeTap, spots: &SpotBook, stream: TcpStream, mut reader: BufReader<TcpStream>, stop: &Arc<AtomicBool>) -> io::Result<()> {
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;
     // Lines from the client on their own thread; rows go out on this one.
     // (view, last heard, has spoken)
     let wanted: Arc<Mutex<(Option<ScopeView>, Instant, bool)>> = Arc::new(Mutex::new((None, Instant::now(), false)));
     let done = Arc::new(AtomicBool::new(false));
+    let wants_spots = Arc::new(AtomicBool::new(false));
     let (ask_tx, ask_rx) = crossbeam_channel::bounded::<(u32, f64, f64)>(4);
     {
-        let (wanted, done) = (wanted.clone(), done.clone());
+        let (wanted, done, wants_spots, spots) = (wanted.clone(), done.clone(), wants_spots.clone(), spots.clone());
         reader.get_ref().set_read_timeout(Some(Duration::from_millis(500)))?;
         thread::Builder::new().name("remote-scope-in".into()).spawn(move || {
             let mut line = String::new();
@@ -1235,6 +1295,10 @@ fn serve_scope(scope: &ScopeTap, stream: TcpStream, mut reader: BufReader<TcpStr
                             w.0 = Some(v);
                         } else if let Some(ask) = scope_msg::parse_detail_line(&line) {
                             let _ = ask_tx.try_send(ask);
+                        } else if let Some((hz, call)) = scope_msg::parse_call_line(&line) {
+                            spots.send_shared_call(hz, call);
+                        } else if line.trim() == "SPOTS" {
+                            wants_spots.store(true, Ordering::Relaxed);
                         } else if line.trim() == "IDLE" {
                             w.0 = None;
                         }
@@ -1249,6 +1313,8 @@ fn serve_scope(scope: &ScopeTap, stream: TcpStream, mut reader: BufReader<TcpStr
     let mut out = stream.try_clone()?;
     let mut sub: Option<ScopeSubscription> = None;
     let mut sent_status: Option<(ScopeStatus, Instant)> = None;
+    let mut spots_seen = None;
+    let mut spots_sent: Option<Instant> = None;
     // Detail asks waiting for the scope's answer.
     let mut asked: Vec<(u32, crossbeam_channel::Receiver<Detail>, Instant)> = Vec::new();
     let result = loop {
@@ -1278,6 +1344,15 @@ fn serve_scope(scope: &ScopeTap, stream: TcpStream, mut reader: BufReader<TcpStr
                 break Err(e);
             }
             sent_status = Some((status, Instant::now()));
+        }
+        // A cluster feed changes all the time: every 2 s is soon enough.
+        if wants_spots.load(Ordering::Relaxed) && spots_sent.is_none_or(|at| at.elapsed() > Duration::from_secs(2)) {
+            if let Some(share) = spots.share(&mut spots_seen) {
+                spots_sent = Some(Instant::now());
+                if let Err(e) = scope_msg::spots(&share).iter().try_for_each(|m| out.write_all(m)) {
+                    break Err(e);
+                }
+            }
         }
         let row = match &sub {
             Some(s) => s.rows.recv_timeout(Duration::from_millis(100)).ok(),
@@ -1315,20 +1390,21 @@ fn serve_scope(scope: &ScopeTap, stream: TcpStream, mut reader: BufReader<TcpStr
 
 /// Shows a remote radio's band scope: keeps a `SCOPE` session to the server
 /// open, asks for the view of whoever watches `tap`, and passes the rows and
-/// the server's scope status on to `tap`.
+/// the server's scope status on to `tap`, and the server's logger spots on to
+/// `spots`.
 pub struct ScopeClient {
     stop: Arc<AtomicBool>,
 }
 
 impl ScopeClient {
-    pub fn start(target: RemoteTarget, tap: ScopeTap) -> ScopeClient {
+    pub fn start(target: RemoteTarget, tap: ScopeTap, spots: SpotBook) -> ScopeClient {
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
         thread::Builder::new()
             .name("remote-scope".into())
             .spawn(move || {
                 while !stop2.load(Ordering::Relaxed) {
-                    let wait = match scope_session(&target, &tap, &stop2) {
+                    let wait = match scope_session(&target, &tap, &spots, &stop2) {
                         Ok(()) => Duration::from_secs(1),
                         Err(e) if e.kind() == io::ErrorKind::Unsupported => {
                             tap.set_status(ScopeStatus { text: "the remote radio's RigHelm is too old for the band scope".into(), ..Default::default() });
@@ -1339,6 +1415,10 @@ impl ScopeClient {
                             Duration::from_secs(3)
                         }
                     };
+                    // Out of touch: they would go stale.
+                    if !stop2.load(Ordering::Relaxed) {
+                        spots.clear();
+                    }
                     let t0 = Instant::now();
                     while t0.elapsed() < wait && !stop2.load(Ordering::Relaxed) {
                         thread::sleep(Duration::from_millis(100));
@@ -1357,7 +1437,7 @@ impl Drop for ScopeClient {
     }
 }
 
-fn scope_session(target: &RemoteTarget, tap: &ScopeTap, stop: &AtomicBool) -> io::Result<()> {
+fn scope_session(target: &RemoteTarget, tap: &ScopeTap, spots: &SpotBook, stop: &AtomicBool) -> io::Result<()> {
     let (stream, _name, _, _, _) = match handshake(&target.addr, &target.password, "SCOPE") {
         Err(e) if e.kind() == io::ErrorKind::PermissionDenied && e.to_string().contains("unsupported mode") => {
             return Err(io::Error::new(io::ErrorKind::Unsupported, e.to_string()));
@@ -1368,6 +1448,8 @@ fn scope_session(target: &RemoteTarget, tap: &ScopeTap, stop: &AtomicBool) -> io
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     let mut reader = stream.try_clone()?;
     let mut writer = stream;
+    writer.write_all(b"SPOTS\n")?;
+    let mut incoming = SpotShare::default();
     let mut sent_view: Option<ScopeView> = None;
     let mut asked: HashMap<u32, crossbeam_channel::Sender<Detail>> = HashMap::new();
     let mut next_id: u32 = 1;
@@ -1399,6 +1481,9 @@ fn scope_session(target: &RemoteTarget, tap: &ScopeTap, stop: &AtomicBool) -> io
                 asked.clear();
             }
             asked.insert(next_id, ask.reply);
+        }
+        for (hz, call) in spots.take_calls() {
+            writer.write_all(scope_msg::call_line(hz, &call).as_bytes())?;
         }
         match reader.read(&mut chunk) {
             Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "server closed the connection")),
@@ -1440,6 +1525,19 @@ fn scope_session(target: &RemoteTarget, tap: &ScopeTap, stop: &AtomicBool) -> io
                         }
                     }
                 }
+                scope_msg::SPOTS => {
+                    if let Some((first, last, part)) = scope_msg::parse_spots(payload) {
+                        if first {
+                            incoming.spots.clear();
+                        }
+                        incoming.spots.extend(part.spots);
+                        if last {
+                            incoming.click_sets_mode = part.click_sets_mode;
+                            incoming.send_call = part.send_call;
+                            spots.mirror(std::mem::take(&mut incoming));
+                        }
+                    }
+                }
                 _ => {}
             }
             buf.drain(..5 + len);
@@ -1457,10 +1555,10 @@ mod tests {
     fn restarts_on_the_same_port_immediately() {
         let rig = Rig::start();
         let cfg = RemoteServerConfig { bind: "127.0.0.1:0".into(), audio: true, rx_device: Some(AudioDevice::Alsa("null".into())), ..Default::default() };
-        let first = RemoteServer::start(rig.clone(), cfg.clone(), ScopeTap::default()).unwrap();
+        let first = RemoteServer::start(rig.clone(), cfg.clone(), ScopeTap::default(), SpotBook::default()).unwrap();
         let addr = first.addr;
         drop(first);
-        let again = RemoteServer::start(rig.clone(), RemoteServerConfig { bind: addr.to_string(), ..cfg }, ScopeTap::default());
+        let again = RemoteServer::start(rig.clone(), RemoteServerConfig { bind: addr.to_string(), ..cfg }, ScopeTap::default(), SpotBook::default());
         assert!(again.is_ok(), "{:?}", again.err());
         rig.shutdown();
     }
@@ -1496,7 +1594,7 @@ mod tests {
     fn remote_control_end_to_end() {
         let server_rig = sim_rig();
         let cfg = RemoteServerConfig { bind: "127.0.0.1:0".into(), password: "secret".into(), audio: false, ..Default::default() };
-        let server = RemoteServer::start(server_rig.clone(), cfg, ScopeTap::default()).unwrap();
+        let server = RemoteServer::start(server_rig.clone(), cfg, ScopeTap::default(), SpotBook::default()).unwrap();
         let addr = server.addr.to_string();
 
         // Wrong password is refused.
@@ -1530,7 +1628,7 @@ mod tests {
     fn memory_channels_reach_remote_clients() {
         let server_rig = sim_rig();
         let cfg = RemoteServerConfig { bind: "127.0.0.1:0".into(), password: "secret".into(), audio: false, ..Default::default() };
-        let server = RemoteServer::start(server_rig.clone(), cfg, ScopeTap::default()).unwrap();
+        let server = RemoteServer::start(server_rig.clone(), cfg, ScopeTap::default(), SpotBook::default()).unwrap();
         let client = Rig::start();
         let link = connect_cat(&RemoteTarget { addr: server.addr.to_string(), password: "secret".into() }).unwrap().0;
         client.connect_link(link, EngineConfig { read_menu_on_connect: false, ..Default::default() });
@@ -1555,7 +1653,7 @@ mod tests {
     fn meters_are_pushed_to_remote_clients() {
         let server_rig = sim_rig();
         let cfg = RemoteServerConfig { bind: "127.0.0.1:0".into(), password: "secret".into(), audio: false, ..Default::default() };
-        let server = RemoteServer::start(server_rig.clone(), cfg, ScopeTap::default()).unwrap();
+        let server = RemoteServer::start(server_rig.clone(), cfg, ScopeTap::default(), SpotBook::default()).unwrap();
         let (mut link, _) = connect_cat(&RemoteTarget { addr: server.addr.to_string(), password: "secret".into() }).unwrap();
         link.writer.write_all(b"AI1;").unwrap();
         server_rig.send("TX1;");
@@ -1592,7 +1690,7 @@ mod tests {
         };
         // Transmit (including mic audio) needs a password on the server.
         let cfg = RemoteServerConfig { tx_audio: true, password: "pw".into(), ..cfg };
-        let server = RemoteServer::start(server_rig.clone(), cfg, ScopeTap::default()).unwrap();
+        let server = RemoteServer::start(server_rig.clone(), cfg, ScopeTap::default(), SpotBook::default()).unwrap();
         let target = RemoteTarget { addr: server.addr.to_string(), password: "pw".into() };
         // The client mirrors the remote radio's state over its own CAT session.
         let client_rig = Rig::start();
@@ -1636,7 +1734,7 @@ mod tests {
         let server_rig = Rig::start();
         server_rig.connect_link(sim.link(), EngineConfig { read_menu_on_connect: false, ..Default::default() });
         // No password: tuning works, transmitting doesn't.
-        let open = RemoteServer::start(server_rig.clone(), RemoteServerConfig { bind: "127.0.0.1:0".into(), audio: false, ..Default::default() }, ScopeTap::default()).unwrap();
+        let open = RemoteServer::start(server_rig.clone(), RemoteServerConfig { bind: "127.0.0.1:0".into(), audio: false, ..Default::default() }, ScopeTap::default(), SpotBook::default()).unwrap();
         let mut c = TcpStream::connect(open.addr).unwrap();
         let mut line = String::new();
         BufReader::new(c.try_clone().unwrap()).read_line(&mut line).unwrap();
@@ -1651,6 +1749,7 @@ mod tests {
             server_rig.clone(),
             RemoteServerConfig { bind: "127.0.0.1:0".into(), audio: false, password: "pw".into(), ..Default::default() },
             ScopeTap::default(),
+            SpotBook::default(),
         )
         .unwrap();
         let link = connect_cat(&RemoteTarget { addr: secured.addr.to_string(), password: "pw".into() }).unwrap().0;
@@ -1691,6 +1790,86 @@ mod tests {
         assert_eq!(scope_msg::parse_row(&[1, 2, 3]), None);
     }
 
+    fn test_spot(call: String, hz: u64) -> SharedSpot {
+        SharedSpot {
+            call,
+            hz,
+            mode: crate::logger::SpotMode::Cw,
+            mode_text: "CW".into(),
+            status: crate::logger::SpotStatus::Other,
+            comment: "x".repeat(200),
+            spotter: "K5KRK".into(),
+            country: String::new(),
+            rules: Vec::new(),
+            source: "QLog".into(),
+            age_s: 90,
+        }
+    }
+
+    #[test]
+    fn a_long_spot_list_splits_into_small_messages() {
+        let share = SpotShare { click_sets_mode: true, send_call: false, spots: (0..2000).map(|i| test_spot(format!("K{i}"), 14_000_000 + i)).collect() };
+        let parts = scope_msg::spots(&share);
+        assert!(parts.len() > 1);
+        let mut got = Vec::new();
+        for (i, m) in parts.iter().enumerate() {
+            assert_eq!(m[0], scope_msg::SPOTS);
+            assert!(m.len() - 5 <= scope_msg::MAX_LEN);
+            let (first, last, part) = scope_msg::parse_spots(&m[5..]).unwrap();
+            assert_eq!((first, last), (i == 0, i == parts.len() - 1));
+            assert!(part.click_sets_mode && !part.send_call);
+            got.extend(part.spots);
+        }
+        assert_eq!(got, share.spots);
+        // An empty list still says so.
+        let empty = scope_msg::spots(&SpotShare::default());
+        assert_eq!(empty.len(), 1);
+        assert_eq!(scope_msg::parse_spots(&empty[0][5..]), Some((true, true, SpotShare::default())));
+    }
+
+    #[test]
+    fn call_lines_round_trip() {
+        assert_eq!(scope_msg::parse_call_line(&scope_msg::call_line(14_074_000, "K1ABC/P")), Some((14_074_000, "K1ABC/P")));
+        assert_eq!(scope_msg::parse_call_line("SPOTCALL nope K1ABC\n"), None);
+    }
+
+    #[test]
+    fn a_remote_client_shows_the_servers_spots() {
+        let server_rig = sim_rig();
+        let (server_spots, client_spots) = (SpotBook::default(), SpotBook::default());
+        let cfg = crate::logger::LoggerConfig { enabled: true, ..Default::default() };
+        server_spots.set_config(&cfg);
+        let listener = crate::logger::SpotListener::start(server_spots.clone(), crate::logger::LoggerConfig { port: 0, ..cfg.clone() }).unwrap();
+        let logger = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        logger.send_to(br#"<spot><app>N1MM</app><dxcall>W1AW</dxcall><frequency>14074.0</frequency><action>add</action></spot>"#, listener.addr).unwrap();
+        let t0 = Instant::now();
+        while server_spots.stats().held == 0 && t0.elapsed() < Duration::from_secs(2) {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let server = RemoteServer::start(
+            server_rig.clone(),
+            RemoteServerConfig { bind: "127.0.0.1:0".into(), audio: false, password: "pw".into(), ..Default::default() },
+            ScopeTap::default(),
+            server_spots.clone(),
+        )
+        .unwrap();
+        client_spots.set_mirror(true);
+        let _client = ScopeClient::start(RemoteTarget { addr: server.addr.to_string(), password: "pw".into() }, ScopeTap::default(), client_spots.clone());
+        let off = crate::logger::LoggerConfig::default();
+        let t0 = Instant::now();
+        while client_spots.on_scope(&off, 14e6, 14.35e6).is_empty() && t0.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(client_spots.on_scope(&off, 14e6, 14.35e6)[0].call, "W1AW");
+        // Clearing them on the radio's computer clears them everywhere.
+        server_spots.clear();
+        let t0 = Instant::now();
+        while !client_spots.on_scope(&off, 14e6, 14.35e6).is_empty() && t0.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(client_spots.on_scope(&off, 14e6, 14.35e6).is_empty());
+    }
+
     #[test]
     fn band_scope_streams_to_a_remote_client() {
         let server_rig = sim_rig();
@@ -1699,6 +1878,7 @@ mod tests {
             server_rig.clone(),
             RemoteServerConfig { bind: "127.0.0.1:0".into(), audio: false, password: "pw".into(), ..Default::default() },
             server_tap.clone(),
+            SpotBook::default(),
         )
         .unwrap();
         // Stand-in for the dongle: rows for whoever watches.
@@ -1716,7 +1896,7 @@ mod tests {
             });
         }
         let client_tap = ScopeTap::default();
-        let _client = ScopeClient::start(RemoteTarget { addr: server.addr.to_string(), password: "pw".into() }, client_tap.clone());
+        let _client = ScopeClient::start(RemoteTarget { addr: server.addr.to_string(), password: "pw".into() }, client_tap.clone(), SpotBook::default());
         let view = ScopeView { center_hz: 7_100_000.0, span_hz: 50_000.0, cols: 500, fps: 20 };
         let sub = client_tap.subscribe(view);
         let row = sub.rows.recv_timeout(Duration::from_secs(5)).expect("a row from the server");
@@ -1747,7 +1927,7 @@ mod tests {
         assert!(!server_tap.has_watchers());
         // A wrong password gets nothing.
         let other = ScopeTap::default();
-        let _bad = ScopeClient::start(RemoteTarget { addr: server.addr.to_string(), password: "nope".into() }, other.clone());
+        let _bad = ScopeClient::start(RemoteTarget { addr: server.addr.to_string(), password: "nope".into() }, other.clone(), SpotBook::default());
         let _sub = other.subscribe(view);
         thread::sleep(Duration::from_millis(800));
         assert!(!other.status().present);

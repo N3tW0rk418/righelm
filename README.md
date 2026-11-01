@@ -346,7 +346,12 @@ from each program.
   up the station ready to log it. This replaces what's in QLog's new contact form. It
   uses the port QLog listens to WSJT-X on, `127.0.0.1:2237` unless you changed it.
 
-Spots only reach RigHelm while it runs, so the scope fills up over a few minutes.
+Spots only reach RigHelm while it runs, so the scope fills up over a few minutes. They
+stay until **Forget a spot after** has passed since they were last heard of.
+
+Over [LAN remote](#remote-operation-over-the-lan), set all this up on the radio's computer
+only. A remote computer's scope shows the same spots, and clicking one there tunes the
+radio and fills in the logger on the radio's computer. That computer needs this version too.
 
 ## Band scope (RTL-SDR dongle or HackRF)
 

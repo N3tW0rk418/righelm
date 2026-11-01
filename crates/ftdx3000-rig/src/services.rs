@@ -398,7 +398,7 @@ impl Services {
             return;
         }
         self.remote_server = None;
-        let r = RemoteServer::start(self.rig.clone(), want.clone(), self.scope_tap.clone()).map_err(|e| e.to_string());
+        let r = RemoteServer::start(self.rig.clone(), want.clone(), self.scope_tap.clone(), self.spots.clone()).map_err(|e| e.to_string());
         if let Err(e) = &r {
             self.rig.note(format!("remote server on {} failed: {e}", want.bind));
         }
@@ -439,11 +439,13 @@ impl Services {
                 self.scope = None;
                 if self.scope_client.as_ref().is_none_or(|(t, _)| *t != target) {
                     self.scope_client = None;
-                    self.scope_client = Some((target.clone(), ScopeClient::start(target, self.scope_tap.clone())));
+                    self.spots.set_mirror(true);
+                    self.scope_client = Some((target.clone(), ScopeClient::start(target, self.scope_tap.clone(), self.spots.clone())));
                 }
             }
             None => {
                 self.scope_client = None;
+                self.spots.set_mirror(false);
                 match &self.scope {
                     Some(s) => s.update(self.config.scope.clone()),
                     None => self.scope = Some(Scope::start(self.rig.clone(), self.scope_tap.clone(), self.config.scope.clone())),
@@ -453,8 +455,12 @@ impl Services {
     }
 
     /// Start, stop or restart the Logger Connect listener to match the config.
+    /// Not while controlling a remote radio: spots go to its computer, and
+    /// that one sends us what it shows.
     pub fn apply_logger(&mut self) {
-        let r = self.logger.apply(&self.spots, &self.config.logger);
+        self.spots.set_config(&self.config.logger);
+        let want = LoggerConfig { enabled: self.config.logger.enabled && self.config.engine.remote.is_none(), ..self.config.logger.clone() };
+        let r = self.logger.apply(&self.spots, &want);
         if let Some(Err(e)) = r {
             self.rig.note(format!("Logger Connect on port {} failed: {e}", self.config.logger.port));
         }
@@ -695,6 +701,7 @@ impl Services {
         self.apply_remote_server();
         self.apply_local_rx();
         self.apply_scope();
+        self.apply_logger();
         self.connect();
         self.apply_tx_audio();
     }
@@ -708,6 +715,7 @@ impl Services {
         self.apply_remote_server();
         self.apply_local_rx();
         self.apply_scope();
+        self.apply_logger();
         self.apply_tx_audio();
         if !self.config.engine.serial.path.is_empty() {
             self.connect();

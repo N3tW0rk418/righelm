@@ -597,8 +597,8 @@ pub fn show(app: &mut crate::App, ui: &mut Ui, rig: &Rig, s: &RadioState) {
         feed_question(app, ui);
     }
     let tap = app.services.scope_tap.clone();
-    let logger = app.services.config.logger.clone();
     let spot_book = app.services.spots.clone();
+    let logger = spot_book.in_force(&app.services.config.logger);
     let prefs = &mut app.services.config.ui;
     let bs = &mut app.scope;
     let vfo = s.rx_freq() as f64;
@@ -880,7 +880,7 @@ pub fn show(app: &mut crate::App, ui: &mut Ui, rig: &Rig, s: &RadioState) {
         }
 
         // DX spots from the logger.
-        let spots = if logger.enabled && logger.show_on_scope { spot_book.in_view(&logger, start, view_hi) } else { Vec::new() };
+        let spots = spot_book.on_scope(&logger, start, view_hi);
         let markers = crate::logger_connect::draw(&p, spots, &logger, x_of, spec);
 
         if bs.transmitting || s.transmitting() {

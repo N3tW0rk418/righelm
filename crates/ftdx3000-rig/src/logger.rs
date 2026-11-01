@@ -12,6 +12,10 @@
 //! to the logger is `SpotBook::send_call`: a spot clicked on the band scope can
 //! fill in the logger's contact form, with the status packet WSJT-X sends when
 //! you pick a station, which QLog and others listen for.
+//!
+//! Spots end at the radio's computer. A remote client shows what that computer
+//! shows: its own listener stays off, the book mirrors a `SpotShare` sent over
+//! the band scope session, and a clicked call goes back for the logger there.
 
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -136,7 +140,7 @@ impl LoggerConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpotMode {
     Cw,
     Phone,
@@ -157,7 +161,7 @@ impl SpotMode {
 
 /// What the logger thinks of a spot, as one scale for both formats: QLog
 /// judges it against your log, N1MM against the contest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum SpotStatus {
     Worked,
     Other,
@@ -234,6 +238,67 @@ impl Spot {
             SpotMode::Digital => Mode::DataUsb,
         })
     }
+}
+
+/// A spot on its way to a remote client: its age stands in for `seen`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SharedSpot {
+    pub call: String,
+    pub hz: u64,
+    pub mode: SpotMode,
+    pub mode_text: String,
+    pub status: SpotStatus,
+    pub comment: String,
+    pub spotter: String,
+    pub country: String,
+    pub rules: Vec<String>,
+    pub source: String,
+    pub age_s: u64,
+}
+
+impl From<&Spot> for SharedSpot {
+    fn from(s: &Spot) -> SharedSpot {
+        SharedSpot {
+            call: s.call.clone(),
+            hz: s.hz,
+            mode: s.mode,
+            mode_text: s.mode_text.clone(),
+            status: s.status,
+            comment: s.comment.clone(),
+            spotter: s.spotter.clone(),
+            country: s.country.clone(),
+            rules: s.rules.clone(),
+            source: s.source.clone(),
+            age_s: s.seen.elapsed().as_secs(),
+        }
+    }
+}
+
+impl From<SharedSpot> for Spot {
+    fn from(s: SharedSpot) -> Spot {
+        let seen = Instant::now().checked_sub(Duration::from_secs(s.age_s)).unwrap_or_else(Instant::now);
+        Spot {
+            call: s.call,
+            hz: s.hz,
+            mode: s.mode,
+            mode_text: s.mode_text,
+            status: s.status,
+            comment: s.comment,
+            spotter: s.spotter,
+            country: s.country,
+            rules: s.rules,
+            source: s.source,
+            seen,
+        }
+    }
+}
+
+/// Everything a remote client needs to show what the radio's computer shows.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpotShare {
+    pub click_sets_mode: bool,
+    pub send_call: bool,
+    pub spots: Vec<SharedSpot>,
 }
 
 /// One packet, understood.
@@ -382,6 +447,15 @@ pub struct SpotStats {
 struct Book {
     spots: Vec<Spot>,
     stats: SpotStats,
+    /// Goes up when what a remote client should see may have changed.
+    generation: u64,
+    /// The settings in force, for what's shared with remote clients.
+    config: LoggerConfig,
+    /// On a remote client: the spots are the radio computer's, and these
+    /// are its click settings.
+    mirror: Option<(bool, bool)>,
+    /// On a remote client: clicked spots for the radio computer's logger.
+    calls: Vec<(u64, String)>,
 }
 
 impl Book {
@@ -398,10 +472,12 @@ impl Book {
         if self.spots.len() > MAX_SPOTS {
             self.spots.remove(0);
         }
+        self.generation += 1;
     }
 
     fn delete(&mut self, call: &str, hz: u64) {
         self.spots.retain(|s| !(s.call == call && s.hz.abs_diff(hz) < SAME_BAND_HZ));
+        self.generation += 1;
     }
 
     fn count(&mut self, name: &str, from: SocketAddr, spots: u64) {
@@ -440,7 +516,11 @@ impl Book {
     }
 
     fn expire(&mut self, max_age: Duration) {
+        let held = self.spots.len();
         self.spots.retain(|s| s.seen.elapsed() < max_age);
+        if self.spots.len() != held {
+            self.generation += 1;
+        }
     }
 }
 
@@ -456,19 +536,112 @@ impl SpotBook {
         b.spots.iter().filter(|s| (lo..hi).contains(&(s.hz as f64)) && cfg.shows(s)).cloned().collect()
     }
 
+    /// The spots for the band scope to draw: this computer's, as the settings
+    /// say, or on a remote client all that the radio's computer sent.
+    pub fn on_scope(&self, cfg: &LoggerConfig, lo: f64, hi: f64) -> Vec<Spot> {
+        {
+            let b = self.0.lock();
+            if b.mirror.is_some() {
+                return b.spots.iter().filter(|s| (lo..hi).contains(&(s.hz as f64))).cloned().collect();
+            }
+        }
+        if cfg.enabled && cfg.show_on_scope { self.in_view(cfg, lo, hi) } else { Vec::new() }
+    }
+
+    /// `cfg` with what a click does, which on a remote client the radio's
+    /// computer decides.
+    pub fn in_force(&self, cfg: &LoggerConfig) -> LoggerConfig {
+        let mut cfg = cfg.clone();
+        if let Some((sets_mode, send_call)) = self.0.lock().mirror {
+            (cfg.click_sets_mode, cfg.send_call) = (sets_mode, send_call);
+        }
+        cfg
+    }
+
+    /// Whether these are a remote radio's spots.
+    pub fn mirrored(&self) -> bool {
+        self.0.lock().mirror.is_some()
+    }
+
+    /// Start or stop mirroring a remote radio's spots. Spots held until now
+    /// aren't that radio's, so they go.
+    pub fn set_mirror(&self, on: bool) {
+        let mut b = self.0.lock();
+        if b.mirror.is_some() != on {
+            b.mirror = on.then_some((false, false));
+            b.spots.clear();
+            b.calls.clear();
+            b.generation += 1;
+        }
+    }
+
+    /// Take in what the radio's computer shows.
+    pub fn mirror(&self, share: SpotShare) {
+        let mut b = self.0.lock();
+        if b.mirror.is_some() {
+            b.mirror = Some((share.click_sets_mode, share.send_call));
+            b.spots = share.spots.into_iter().take(MAX_SPOTS).map(Spot::from).collect();
+        }
+    }
+
+    /// The settings to share with remote clients. Call when they change.
+    pub fn set_config(&self, cfg: &LoggerConfig) {
+        let mut b = self.0.lock();
+        if b.config != *cfg {
+            b.config = cfg.clone();
+            b.generation += 1;
+        }
+    }
+
+    /// What a remote client should show, if it changed since `seen`.
+    pub fn share(&self, seen: &mut Option<u64>) -> Option<SpotShare> {
+        let mut b = self.0.lock();
+        let cfg = b.config.clone();
+        b.expire(Duration::from_secs(cfg.max_age_min.max(1) as u64 * 60));
+        if *seen == Some(b.generation) {
+            return None;
+        }
+        *seen = Some(b.generation);
+        let spots = if cfg.enabled && cfg.show_on_scope { b.spots.iter().filter(|s| cfg.shows(s)).map(SharedSpot::from).collect() } else { Vec::new() };
+        Some(SpotShare { click_sets_mode: cfg.click_sets_mode, send_call: cfg.send_call, spots })
+    }
+
+    /// A remote client clicked this spot: fill in the logger here.
+    pub fn send_shared_call(&self, hz: u64, call: &str) {
+        let (cfg, spot) = {
+            let b = self.0.lock();
+            (b.config.clone(), b.spots.iter().find(|s| s.hz == hz && s.call == call).cloned())
+        };
+        if let Some(spot) = spot {
+            self.send_call(&cfg, &spot);
+        }
+    }
+
+    /// The clicked spots waiting to go to the radio's computer.
+    pub fn take_calls(&self) -> Vec<(u64, String)> {
+        std::mem::take(&mut self.0.lock().calls)
+    }
+
     pub fn stats(&self) -> SpotStats {
         let b = self.0.lock();
         SpotStats { held: b.spots.len(), ..b.stats.clone() }
     }
 
     pub fn clear(&self) {
-        self.0.lock().spots.clear();
+        let mut b = self.0.lock();
+        b.spots.clear();
+        b.generation += 1;
     }
 
     /// Fill in the logger's contact form with a clicked spot, if set to.
     pub fn send_call(&self, cfg: &LoggerConfig, spot: &Spot) {
         if cfg.send_call {
-            self.0.lock().stats.last_sent = Some(send_status(&cfg.send_to, spot).map(|()| spot.call.clone()));
+            let mut b = self.0.lock();
+            if b.mirror.is_some() {
+                b.calls.push((spot.hz, spot.call.clone()));
+                return;
+            }
+            b.stats.last_sent = Some(send_status(&cfg.send_to, spot).map(|()| spot.call.clone()));
         }
     }
 }
@@ -777,6 +950,63 @@ mod tests {
         assert_eq!(shown.len(), 1);
         assert_eq!(shown[0].call, "NEW");
         assert_eq!(book.stats().held, 1);
+    }
+
+    #[test]
+    fn a_share_shows_what_the_settings_show_and_only_when_changed() {
+        let book = SpotBook::default();
+        let cfg = LoggerConfig { enabled: true, show_worked: false, max_age_min: 5, ..Default::default() };
+        book.set_config(&cfg);
+        book.0.lock().receive(&cfg, QLOG.as_bytes(), peer());
+        let worked = Spot { status: SpotStatus::Worked, call: "W1AW".into(), ..book.0.lock().spots[0].clone() };
+        book.0.lock().add(worked);
+        let mut seen = None;
+        let share = book.share(&mut seen).unwrap();
+        assert_eq!(share.spots.iter().map(|s| s.call.as_str()).collect::<Vec<_>>(), ["YB0AR"]);
+        assert!(book.share(&mut seen).is_none());
+        book.set_config(&LoggerConfig { show_on_scope: false, ..cfg });
+        assert!(book.share(&mut seen).unwrap().spots.is_empty());
+    }
+
+    #[test]
+    fn a_mirror_shows_the_share_unfiltered_and_sends_calls_back() {
+        let source = SpotBook::default();
+        let cfg = LoggerConfig { enabled: true, send_call: true, click_sets_mode: false, ..Default::default() };
+        source.set_config(&cfg);
+        source.0.lock().receive(&cfg, QLOG.as_bytes(), peer());
+        let share = source.share(&mut None).unwrap();
+
+        let client = SpotBook::default();
+        client.0.lock().receive(&cfg, N1MM.as_bytes(), peer());
+        client.set_mirror(true);
+        assert_eq!(client.stats().held, 0, "this computer's spots aren't the radio's");
+        client.mirror(share);
+        let local = LoggerConfig { enabled: false, show_other: false, show_new: false, ..Default::default() };
+        let shown = client.on_scope(&local, 7e6, 7.3e6);
+        assert_eq!(shown[0].call, "YB0AR");
+        let force = client.in_force(&local);
+        assert!(force.send_call && !force.click_sets_mode);
+        client.send_call(&force, &shown[0]);
+        assert_eq!(client.take_calls(), [(shown[0].hz, "YB0AR".to_string())]);
+        assert_eq!(client.stats().last_sent, None, "the logger is on the radio's computer");
+
+        client.set_mirror(false);
+        assert!(client.on_scope(&local, 7e6, 7.3e6).is_empty());
+    }
+
+    #[test]
+    fn a_shared_call_only_goes_for_a_spot_held_here() {
+        let logger = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        logger.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let cfg = LoggerConfig { enabled: true, send_call: true, send_to: logger.local_addr().unwrap().to_string(), ..Default::default() };
+        let book = SpotBook::default();
+        book.set_config(&cfg);
+        book.0.lock().receive(&cfg, QLOG.as_bytes(), peer());
+        book.send_shared_call(1, "YB0AR");
+        assert_eq!(book.stats().last_sent, None);
+        book.send_shared_call(7_188_000, "YB0AR");
+        assert_eq!(book.stats().last_sent, Some(Ok("YB0AR".to_string())));
+        assert!(logger.recv(&mut [0; 512]).is_ok());
     }
 
     #[test]
