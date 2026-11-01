@@ -22,6 +22,7 @@ pub use services::{Config, Macro, Services, UiPrefs};
 pub mod audio;
 pub mod cw;
 pub mod remote;
+pub mod hackrf;
 pub mod scope;
 pub mod spectrum;
 pub mod txaudio;

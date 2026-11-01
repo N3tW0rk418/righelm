@@ -164,7 +164,8 @@ fn mic_controls(app: &mut App, ui: &mut Ui, remote: bool) {
     }
 }
 
-/// The RTL-SDR band scope: which jack the dongle is on, and calibration.
+/// The band scope (RTL-SDR or HackRF): which jack it is on, its gain, and
+/// calibration.
 fn scope_panel(app: &mut App, ui: &mut Ui) {
     use ftdx3000_rig::scope::{DEFAULT_IF_HZ, Feed};
     let status = app.services.scope_status();
@@ -172,7 +173,7 @@ fn scope_panel(app: &mut App, ui: &mut Ui) {
     let before = app.services.config.scope.clone();
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.set_width(ui.available_width());
-        ui.label(RichText::new("Band scope (RTL-SDR)").strong().size(16.0).color(ink(AMBER)));
+        ui.label(RichText::new("Band scope (RTL-SDR or HackRF)").strong().size(16.0).color(ink(AMBER)));
         let color = if status.running { GREEN } else if status.present { AMBER } else { DIM };
         ui.label(RichText::new(if status.text.is_empty() { "starting…" } else { &status.text }).color(ink(color)));
         if remote {
@@ -180,7 +181,7 @@ fn scope_panel(app: &mut App, ui: &mut Ui) {
             return;
         }
         let cfg = &mut app.services.config.scope;
-        ui.checkbox(&mut cfg.enabled, "Use an RTL-SDR dongle when one is plugged in");
+        ui.checkbox(&mut cfg.enabled, "Use an RTL-SDR dongle or HackRF when one is plugged in");
         if status.dongles.len() > 1 {
             ui.horizontal(|ui| {
                 ui.label("Dongle");
@@ -200,6 +201,22 @@ fn scope_panel(app: &mut App, ui: &mut Ui) {
             ui.selectable_value(&mut cfg.feed, Feed::RxOut, "RX OUT (antenna)")
                 .on_hover_text("The receive antenna signal. The dongle tunes itself to show the whole band (or around the VFO).");
         });
+        // The one in use: the chosen one, or the first found.
+        let in_use = status.dongles.iter().find(|(serial, _)| *serial == cfg.serial).or(status.dongles.first());
+        if in_use.is_some_and(|(serial, _)| serial.starts_with("hackrf:")) {
+            ui.horizontal(|ui| {
+                ui.label("HackRF gain: RF");
+                ui.add(egui::Slider::new(&mut cfg.hackrf_lna_db, 0..=40).step_by(8.0).suffix(" dB"));
+                ui.label("baseband");
+                ui.add(egui::Slider::new(&mut cfg.hackrf_vga_db, 0..=62).step_by(2.0).suffix(" dB"));
+                ui.checkbox(&mut cfg.hackrf_amp, "+14 dB amplifier")
+                    .on_hover_text("The HackRF's front-end amplifier. Rarely needed on IF OUT; can overload on a strong band.");
+            });
+            ui.label(
+                RichText::new("The HackRF has no gain control of its own: raise the gain until the noise floor lifts off the bottom, but not so far that strong signals grow copies.")
+                    .color(DIM),
+            );
+        }
         if cfg.feed == Feed::IfOut {
             ui.horizontal(|ui| {
                 ui.label("IF frequency");
@@ -233,7 +250,7 @@ fn scope_panel(app: &mut App, ui: &mut Ui) {
             crate::demo::mark("calibrate", calibrate.rect);
             if calibrate
                 .on_hover_text("Measures shortwave broadcast stations and time signals (WWV, CHU) in view, whose frequencies are exact, and corrects the scope to match. Takes a few seconds.")
-                .on_disabled_hover_text("Plug in the RTL-SDR dongle first.")
+                .on_disabled_hover_text("Plug in the RTL-SDR dongle or HackRF first.")
                 .clicked()
             {
                 app.services.scope_tap.request_calibration();
