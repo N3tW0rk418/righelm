@@ -25,6 +25,8 @@ Besides the FTDX3000 it controls 31 other Yaesu, Icom, Kenwood and Elecraft radi
   wide spectrum and waterfall of the band (up to 1.6 MHz) appears by itself, follows the
   VFO, and tunes the radio with a click. Nothing else to install, and remote computers
   see it too (see below).
+- **Logger Connect.** DX spots from QLog, N1MM+ and others as markers on the band scope.
+  Click one to tune to it and fill in the logger.
 - **Auto-detect.** Finds the radio's USB bridge (Yaesu's CP2105: Enhanced = CAT, Standard =
   keying; Icom's and Kenwood's CP2102; the IC-705's own ports; FTDI for Elecraft) and the
   radio's own USB audio codec. The two are paired because they sit on the same internal USB
@@ -317,6 +319,34 @@ radio**, set a password, and enable it. On any other computer, start the app and
   silently dropped network connection is detected within 5 seconds.
 - **No stale commands.** Commands sent while the radio is disconnected are discarded, not
   replayed later.
+
+## Logger Connect (DX spots on the band scope)
+
+RigHelm can show DX spots from your logging program on the band scope: a marker at each
+spot's frequency, with its callsign as far as there's room. It only listens, and spots
+change nothing by themselves. Turn it on in *Settings → Logger Connect*, then point your
+logger at the address shown there:
+
+- **QLog**: *Settings → Network → Notifications*, set **DX Spots** to `127.0.0.1:12060`,
+  and **Spot Alerts** too if you use alert rules.
+- **N1MM+**, and **DXLog** and **Logger32**, which send the same format: turn on their
+  spot broadcast and send it to the same address. From another computer, choose *This
+  computer and the network* and use this computer's address.
+
+**Send a test spot** shows whether it all works, and the panel lists what has been heard
+from each program.
+
+- **Colours** show what your logger says: alert, new one, new band or mode, already
+  worked. Hover over a marker for the details.
+- **Click a marker to tune to it**, and to set the mode unless you turn that off.
+- **Show** picks what appears: a spot shows if anything about it is ticked, in a mode
+  that's ticked. For Parks on the Air only, click **None** and tick **POTA**. QLog sends
+  every cluster spot, ignoring its own filters, so this is where to narrow them down.
+- **Clicking a spot fills in the callsign in the logger**, when turned on, so QLog looks
+  up the station ready to log it. This replaces what's in QLog's new contact form. It
+  uses the port QLog listens to WSJT-X on, `127.0.0.1:2237` unless you changed it.
+
+Spots only reach RigHelm while it runs, so the scope fills up over a few minutes.
 
 ## Band scope (RTL-SDR dongle or HackRF)
 
