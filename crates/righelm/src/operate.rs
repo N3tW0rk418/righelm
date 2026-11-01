@@ -18,6 +18,14 @@ pub struct OperateState {
     needles: std::collections::HashMap<Meter, (f32, Instant)>,
     keyer_text: [String; 5],
     keyer_loaded: [bool; 5],
+    /// The tuner's power meter shows 1 kW full scale until then (an
+    /// amplifier is in line).
+    tuner_kw_until: Option<Instant>,
+    /// The tuner's meters, held like the radio's: the power bar (watts,
+    /// drawn at), its peak (watts, since), and the last SWR (since).
+    tuner_needle: (f32, Instant),
+    tuner_peak: (f32, Instant),
+    tuner_swr: (f32, Instant),
 }
 
 impl Default for OperateState {
@@ -28,6 +36,10 @@ impl Default for OperateState {
             needles: Default::default(),
             keyer_text: Default::default(),
             keyer_loaded: [false; 5],
+            tuner_kw_until: None,
+            tuner_needle: (0.0, Instant::now()),
+            tuner_peak: (0.0, Instant::now()),
+            tuner_swr: (0.0, Instant::now()),
         }
     }
 }
@@ -98,6 +110,7 @@ enum Group {
     Receiver,
     Dsp,
     Transmitter,
+    Tuner,
     Clarifier,
     Cw,
     Macros,
@@ -106,7 +119,7 @@ enum Group {
 
 /// Receive-side groups (left of the scope), then transmit-side (right).
 const LEFT: [Group; 3] = [Group::Filter, Group::Receiver, Group::Dsp];
-const RIGHT: [Group; 5] = [Group::Transmitter, Group::Clarifier, Group::Cw, Group::Macros, Group::Rotator];
+const RIGHT: [Group; 6] = [Group::Tuner, Group::Transmitter, Group::Clarifier, Group::Cw, Group::Macros, Group::Rotator];
 
 /// Narrowest a column of groups gets.
 const COLUMN_MIN: f32 = 270.0;
@@ -117,6 +130,7 @@ fn draw_group(app: &mut App, ui: &mut Ui, rig: &Rig, s: &RadioState, g: Group) {
         Group::Receiver => receiver_group(ui, rig, s),
         Group::Dsp => dsp_group(ui, rig, s),
         Group::Transmitter => transmitter_group(ui, rig, s),
+        Group::Tuner => tuner_group(ui, app, s),
         Group::Clarifier => clarifier_group(ui, rig, s),
         Group::Cw => cw_group(ui, &mut app.operate, rig, s),
         Group::Macros => macro_group(ui, app, rig),
@@ -128,12 +142,14 @@ fn draw_group(app: &mut App, ui: &mut Ui, rig: &Rig, s: &RadioState, g: Group) {
 /// wide enough for more than one.
 fn stack(app: &mut App, ui: &mut Ui, rig: &Rig, s: &RadioState, id: &str, groups: &[Group]) {
     let prefs = &app.services.config.ui;
+    let tuner = app.services.tuner.is_some();
     let groups: Vec<Group> = groups
         .iter()
         .copied()
         .filter(|g| match g {
             Group::Macros => prefs.show_macros,
             Group::Rotator => prefs.show_rotator && s.model.has("RO"),
+            Group::Tuner => tuner,
             Group::Clarifier => s.model.has("RT") || s.model.has("XT"),
             Group::Cw => s.model.has("KS") || s.model.has("KR"),
             _ => true,
@@ -874,6 +890,130 @@ fn group(ui: &mut Ui, title: &str, body: impl FnOnce(&mut Ui)) {
         ui.spacing_mut().slider_width = (ui.available_width() - 165.0).clamp(70.0, 260.0);
         ui.label(RichText::new(title).strong().size(15.0).color(ink(AMBER)));
         body(ui);
+    });
+}
+
+/// Where an SWR sits on a meter: 1, 1.5, 2, 3 and 5:1 spread out like the
+/// radio's own SWR meter.
+fn swr_fraction(swr: f32) -> f32 {
+    const AT: [(f32, f32); 6] = [(1.0, 0.0), (1.5, 0.2), (2.0, 0.35), (3.0, 0.5), (5.0, 0.75), (10.0, 1.0)];
+    for w in AT.windows(2) {
+        let ((a, fa), (b, fb)) = (w[0], w[1]);
+        if swr <= b {
+            return fa + (fb - fa) * ((swr.max(a) - a) / (b - a));
+        }
+    }
+    1.0
+}
+
+/// The LDG tuner: its own power and SWR readings, and its buttons.
+fn tuner_group(ui: &mut Ui, app: &mut App, s: &RadioState) {
+    use ftdx3000_rig::ldg::{LdgCommand, TuneResult, TunerMode};
+    let Some(tuner) = &app.services.tuner else { return };
+    let st = tuner.status();
+    // The tuner's thread doesn't wake the window: look again soon.
+    ui.ctx().request_repaint_after(Duration::from_millis(if s.transmitting() || st.busy.is_some() { 100 } else { 1000 }));
+    group(ui, "LDG Tuner", |ui| {
+        if !st.connected {
+            ui.label(RichText::new(&st.text).color(ink(AMBER)));
+            return;
+        }
+        let w = ui.available_width();
+        // Over 100 W means an amplifier: switch to 1 kW and stay there a
+        // while, so SSB peaks don't flip the scale back and forth.
+        let now = Instant::now();
+        if st.forward_w > 110.0 {
+            app.operate.tuner_kw_until = Some(now + Duration::from_secs(10));
+        }
+        let big = app.operate.tuner_kw_until.is_some_and(|t| t > now);
+        let full = if big { 1000.0 } else { 100.0 };
+        const TICKS_100: &[(f32, &str)] = &[(0.0, "0"), (0.25, "25"), (0.5, "50"), (0.75, "75"), (1.0, "100")];
+        const TICKS_1K: &[(f32, &str)] = &[(0.0, "0"), (0.25, "250"), (0.5, "500"), (0.75, "750"), (1.0, "1k")];
+        // Like the radio's meters: the bar rises at once and falls back
+        // slowly, the peak holds a moment, and SWR keeps its last reading
+        // through the gaps in CW and speech.
+        const HOLD: Duration = Duration::from_millis(1500);
+        let op = &mut app.operate;
+        let dt = now.duration_since(op.tuner_needle.1).as_secs_f32();
+        let tau = if st.forward_w > op.tuner_needle.0 { 0.03 } else { 0.3 };
+        op.tuner_needle = (op.tuner_needle.0 + (st.forward_w - op.tuner_needle.0) * (1.0 - (-dt / tau).exp()), now);
+        if st.forward_w >= op.tuner_peak.0 || now.duration_since(op.tuner_peak.1) > HOLD {
+            op.tuner_peak = (st.forward_w, now);
+        }
+        if let Some(v) = st.swr {
+            op.tuner_swr = (v, now);
+        }
+        let swr_held = (now.duration_since(op.tuner_swr.1) < HOLD).then_some(op.tuner_swr.0);
+        let (needle, peak) = (op.tuner_needle.0, op.tuner_peak.0);
+        if needle > 0.05 || peak > 0.0 || swr_held.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(16));
+        }
+        widgets::Meter {
+            label: "PO",
+            fraction: (needle / full).min(1.0),
+            text: if peak >= 0.5 { format!("{peak:.0} W") } else { "—".into() },
+            color: AMBER,
+            ticks: if big { TICKS_1K } else { TICKS_100 },
+            red_from: None,
+            peak: (peak >= 0.5).then_some((peak / full).min(1.0)),
+        }
+        .show_sized(ui, w, 26.0)
+        .on_hover_text(format!("Measured by the tuner; reflected {:.1} W", st.reflected_w));
+        widgets::Meter {
+            label: "SWR",
+            fraction: swr_held.map_or(0.0, swr_fraction),
+            text: swr_held.map_or("—".into(), |v| if v >= 99.0 { "∞".into() } else { format!("{v:.2}:1") }),
+            color: CYAN,
+            ticks: &[(0.0, "1"), (0.2, "1.5"), (0.35, "2"), (0.5, "3"), (0.75, "5"), (1.0, "∞")],
+            red_from: Some(0.35),
+            peak: None,
+        }
+        .show_sized(ui, w, 26.0);
+        let busy = st.busy.is_some();
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled_ui(!busy && !s.transmitting(), |ui| {
+                if ui
+                    .add(egui::Button::new(RichText::new("TUNE").strong()).min_size(egui::vec2(62.0, 26.0)).fill(Color32::from_rgb(40, 34, 20)))
+                    .on_hover_text("Transmits! A low-power CW carrier while the tuner tunes from memory (or searches); power and mode are put back afterwards. Put an amplifier in standby first.")
+                    .clicked()
+                {
+                    tuner.send(LdgCommand::Tune { full: false });
+                }
+                if ui
+                    .add(egui::Button::new("FULL").min_size(egui::vec2(54.0, 26.0)))
+                    .on_hover_text("Transmits! A full search for a match, ignoring the tuner's memory (slower). Put an amplifier in standby first.")
+                    .clicked()
+                {
+                    tuner.send(LdgCommand::Tune { full: true });
+                }
+            });
+            ui.add_enabled_ui(!busy, |ui| {
+                let mode = st.mode;
+                if led_button(ui, mode == Some(TunerMode::Auto), "AUTO", GREEN) {
+                    tuner.send(LdgCommand::Auto);
+                }
+                if led_button(ui, mode == Some(TunerMode::Manual), "MAN", AMBER) {
+                    tuner.send(LdgCommand::Manual);
+                }
+                if led_button(ui, mode == Some(TunerMode::Bypass), "BYP", RED) {
+                    tuner.send(LdgCommand::Bypass);
+                }
+                let ant = st.antenna.map_or("ANT ?".to_string(), |a| format!("ANT {a}"));
+                if button(ui, &ant) {
+                    tuner.send(LdgCommand::ToggleAntenna);
+                }
+            });
+        });
+        let line = match (st.busy, st.last_tune) {
+            (Some(b), _) => RichText::new(format!("{b}…")).color(ink(AMBER)),
+            (None, Some(r)) => RichText::new(r.label()).color(ink(if r == TuneResult::Failed { RED } else { GREEN })),
+            (None, None) if st.mode.is_none() => RichText::new("mode and antenna show once set from here").color(DIM),
+            _ => RichText::new("").color(DIM),
+        };
+        ui.label(line);
+        if st.text != "connected" {
+            ui.label(RichText::new(&st.text).color(ink(AMBER)));
+        }
     });
 }
 

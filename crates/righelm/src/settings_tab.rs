@@ -17,6 +17,8 @@ pub fn show(app: &mut App, ui: &mut Ui) {
         ui.add_space(12.0);
         crate::logger_connect::settings_panel(app, ui);
         ui.add_space(12.0);
+        tuner_panel(app, ui);
+        ui.add_space(12.0);
         display(app, ui);
         ui.add_space(12.0);
         about(app, ui);
@@ -286,6 +288,62 @@ fn scope_panel(app: &mut App, ui: &mut Ui) {
             app.services.config.scope.feed_confirmed = true;
         }
         app.services.apply_scope();
+        let _ = app.services.config.save();
+    }
+}
+
+/// An LDG tuner on its meter jack: which port, and the tune carrier.
+fn tuner_panel(app: &mut App, ui: &mut Ui) {
+    let remote = app.services.config.engine.remote.is_some();
+    let before = app.services.config.tuner.clone();
+    let status = app.services.tuner.as_ref().map(|t| t.status());
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(RichText::new("LDG tuner (AT-1000ProII / AT-600ProII)").strong().size(16.0).color(ink(AMBER)));
+        if let Some(st) = &status {
+            ui.label(RichText::new(&st.text).color(ink(if st.connected { GREEN } else { AMBER })));
+        }
+        if remote {
+            ui.label(RichText::new("The tuner is controlled from the radio's computer; it is set up there.").color(DIM));
+            return;
+        }
+        let cfg = &mut app.services.config.tuner;
+        ui.checkbox(&mut cfg.enabled, "Use an LDG tuner connected to its Ext. Meter jack");
+        ui.horizontal(|ui| {
+            ui.label("Serial port");
+            let shown = if cfg.port.is_empty() { "choose…".to_string() } else { cfg.port.clone() };
+            egui::ComboBox::from_id_salt("tuner-port").selected_text(shown).width(380.0).show_ui(ui, |ui| {
+                for p in ftdx3000_rig::detect::list_serial_ports() {
+                    let path = p.port.stable_path().to_string();
+                    if ui.selectable_label(cfg.port == path, format!("{}  — {}", p.port.dev, p.description)).clicked() {
+                        cfg.port = path;
+                        // Choosing its port means using it.
+                        cfg.enabled = true;
+                    }
+                }
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.label("Tune carrier");
+            ui.add(egui::DragValue::new(&mut cfg.tune_watts).range(5..=50).suffix(" W"))
+                .on_hover_text("TUNE switches the radio to CW at this power, keys a carrier while the LDG tunes, then puts the power and mode back.");
+            ui.label("Meter calibration");
+            ui.add(egui::DragValue::new(&mut cfg.meter_k).range(10.0..=60.0).speed(0.05))
+                .on_hover_text("29.16 was measured on an AT-1000ProII with 10 W and 50 W carriers. If the tuner's power reads high against a known power, raise it; low, lower it.");
+            if ui.small_button("reset").clicked() {
+                cfg.meter_k = ftdx3000_rig::ldg::METER_K;
+            }
+        });
+        ui.label(
+            RichText::new(
+                "The meter jack is a 4-pin mini-DIN with 5 V (TTL) serial: use a USB-TTL adapter, not an RS-232 one. \
+                 Its pin 1 carries 12 V: don't use an S-Video cable. The tuner reads power and SWR only while you transmit.",
+            )
+            .color(DIM),
+        );
+    });
+    if app.services.config.tuner != before {
+        app.services.apply_tuner();
         let _ = app.services.config.save();
     }
 }

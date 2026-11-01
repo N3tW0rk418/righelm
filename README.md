@@ -433,6 +433,44 @@ scope, with no dongle of its own. It asks for just the view it shows, so the str
 about 130 kbit/s at the normal speed (250 at fast), over the same TCP port 4533. The dongle only runs
 while somebody is looking at the scope.
 
+## LDG tuner (AT-1000ProII, AT-600ProII)
+
+These LDG tuners have a rear **Ext. Meter** jack (4-pin mini-DIN) for LDG's external meter.
+It is also a serial port, and LDG published its protocol. With a USB-TTL serial adapter on
+it, RigHelm shows the tuner's own power and SWR meter and its buttons on the Operate page:
+
+- **TUNE** (tune from memory, or search) and **FULL** (a full search). Both transmit:
+  RigHelm turns the radio's own tuner off, switches to CW at a low power (*Settings → LDG
+  tuner*, 15 W unless you change it), holds the CW key down until the tuner says it's done
+  (20 s at most), then puts the power, mode and break-in back. It keys the way the CW key
+  does (menu 065 PC KEYING = RTS), so disarm the CW key first. Put an amplifier in
+  standby first.
+- **AUTO**, **MAN** (semi-automatic) and **BYP** (bypass), and **ANT 1/2**.
+- The power meter switches to 1 kW full scale when an amplifier is in line. Its
+  calibration (*Settings → LDG tuner → Meter calibration*) was measured on one
+  AT-1000ProII with 10 W and 50 W carriers; above about 100 W it is approximate. SWR
+  doesn't depend on it.
+
+To set it up:
+
+1. Wire a USB-TTL (5 V) serial adapter to the jack: pin 2 ground, pin 3 the adapter's TX
+   (into the tuner), pin 4 the adapter's RX. Pin 1 carries 12 V: leave it unconnected, and
+   don't use an S-Video cable (it joins pins). An RS-232 adapter needs a level converter.
+2. In *Settings → LDG tuner*, choose the adapter's serial port.
+
+Good to know:
+
+- The tuner reads power and SWR only while you transmit. Between transmissions RigHelm
+  lets the tuner's processor sleep, as LDG designed it, so it adds no digital noise to the
+  receiver.
+- Switched off at its power button, the tuner doesn't answer at all, so it can't be
+  switched on from the computer. RigHelm shows it as off and finds it again when you
+  switch it on.
+- The tuner can't be asked its antenna or mode, so RigHelm shows what the tuner last
+  reported to it, remembered across restarts. If you change them on the tuner's front
+  panel, RigHelm shows the change after your next press of that button in RigHelm.
+- RigHelm never takes the tuner's adapter for the radio when it looks for the radio.
+
 ## Testing without the radio
 
 ```bash

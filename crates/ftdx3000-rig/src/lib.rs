@@ -21,6 +21,7 @@ pub mod services;
 pub use services::{Config, Macro, Services, UiPrefs};
 pub mod audio;
 pub mod cw;
+pub mod ldg;
 pub mod logger;
 pub mod remote;
 pub mod hackrf;
