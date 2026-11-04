@@ -304,6 +304,12 @@ impl Session {
                         s.push_str(v);
                         s.push('\n');
                     }
+                    // rigctld ends answers to commands not flagged ARG_OUT
+                    // with "RPRT 0", and Hamlib 4.6+ waits for that line (5 s
+                    // without it, before every mode change).
+                    if name == "get_lock_mode" {
+                        s.push_str("RPRT 0\n");
+                    }
                 }
                 s
             }
@@ -386,9 +392,17 @@ impl Session {
                 let width = num(1).map(|w| w as i64).unwrap_or(-1);
                 let s = self.state();
                 if s.mode_a != Some(mode) {
+                    // The radio may move VFO-A by itself when the mode changes
+                    // (an FTDX3000 moved it 1240 Hz going USB <-> LSB). Clients
+                    // usually set the frequency first, so put it back after.
+                    // The read includes a frequency the client just set.
+                    let keep = self.read("FA;").ok().and_then(|a| a.get(2..a.len() - 1)?.parse::<u64>().ok());
                     let r = self.send(&ftdx3000_cat::set_mode_cmd(mode));
                     if !matches!(r, Out::Ok) {
                         return r;
+                    }
+                    if let Some(hz) = keep.filter(|hz| s.model.in_range(*hz)) {
+                        self.send(&ftdx3000_cat::set_freq_cmd_for(s.model, false, hz));
                     }
                 }
                 // Mode change may change the width table; use the target mode's.
@@ -984,6 +998,8 @@ mod tests {
         assert!(s.execute("\\dump_state").unwrap().ends_with("done\n"));
         assert_eq!(s.execute("w ID;").unwrap(), "ID0462;\n");
         assert_eq!(s.execute("\\get_powerstat").unwrap(), "1\n");
+        assert_eq!(s.execute("\\get_lock_mode").unwrap(), "0\nRPRT 0\n");
+        assert_eq!(s.execute("+\\get_lock_mode").unwrap(), "get_lock_mode:\nLocked: 0\nRPRT 0\n");
         assert_eq!(s.execute("Y 1").unwrap(), "RPRT -4\n");
         // Hostile numbers don't panic.
         assert_eq!(s.execute("J -1e12").unwrap(), "RPRT 0\n");
@@ -1004,6 +1020,23 @@ mod tests {
         assert!(!sim.core().mox);
         s.cfg.block_tx = false;
         assert!(s.execute("q").is_none());
+        s.rig.shutdown();
+    }
+
+    #[test]
+    fn mode_change_keeps_the_frequency() {
+        let (mut s, sim) = session();
+        sim.core().sideband_shift = 1240;
+        // Frequency first, then the mode, as QLog does for a spot.
+        assert_eq!(s.execute("F 7267000").unwrap(), "RPRT 0\n");
+        assert_eq!(s.execute("M LSB -1").unwrap(), "RPRT 0\n");
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(sim.core().mode_a, Mode::Lsb);
+        assert_eq!(sim.core().freq_a, 7_267_000);
+        assert_eq!(s.execute("M USB -1").unwrap(), "RPRT 0\n");
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(sim.core().freq_a, 7_267_000);
+        assert_eq!(s.execute("f").unwrap(), "7267000\n");
         s.rig.shutdown();
     }
 

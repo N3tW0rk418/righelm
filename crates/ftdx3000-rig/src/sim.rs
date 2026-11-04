@@ -34,6 +34,9 @@ pub struct SimCore {
     pub freq_b: u64,
     pub mode_a: Mode,
     pub mode_b: Mode,
+    /// Hz VFO-A moves by itself going from USB to LSB (and back the other
+    /// way), as a real FTDX3000 was seen to do. 0 = the dial stays put.
+    pub sideband_shift: i64,
     pub power_on: bool,
     pub ai: bool,
     pub tx: u8,
@@ -136,6 +139,7 @@ impl SimCore {
             freq_b,
             mode_a: Mode::Usb,
             mode_b: Mode::Usb,
+            sideband_shift: 0,
             power_on: true,
             ai: false,
             tx: 0,
@@ -289,6 +293,11 @@ impl SimCore {
                 let Some(m) = p.get(1..2).and_then(|c| Mode::from_code(c.chars().next()?)) else { return false };
                 if p.len() != 2 || !self.model.modes.contains(&m) {
                     return false;
+                }
+                match (self.mode_a, m) {
+                    (Mode::Usb, Mode::Lsb) => self.freq_a = (self.freq_a as i64 + self.sideband_shift) as u64,
+                    (Mode::Lsb, Mode::Usb) => self.freq_a = (self.freq_a as i64 - self.sideband_shift) as u64,
+                    _ => {}
                 }
                 self.mode_a = m;
             }
